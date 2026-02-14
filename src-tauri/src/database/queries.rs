@@ -26,9 +26,95 @@ pub fn get_activities(
         Ok(Activity {
             id: row.get(0)?,
             app_name: row.get(1)?,
-            app_hash: row.get(2)?,
-            window_title: row.get(3)?,
-            window_title_hash: row.get(4)?,
+            app_hash: row.get::<_, i64>(2)? as u64,
+            window_title: row.get::<_, String>(3).unwrap_or_default(),
+            window_title_hash: row.get::<_, i64>(4).unwrap_or(0) as u64,
+            category_id: row.get(5)?,
+            start_time: row.get(6)?,
+            end_time: row.get(7)?,
+            duration_seconds: row.get(8)?,
+            metadata: row.get::<_, Option<Vec<u8>>>(9)?.map(|b| {
+                serde_json::from_slice(&b).unwrap_or_default()
+            }),
+        })
+    })?.collect::<Result<Vec<_>, _>>()?;
+
+    Ok(activities)
+}
+
+/// Search activities by title/app keywords at the SQL level.
+/// Efficient for broad queries spanning many days (e.g., "all songs I've heard").
+pub fn search_activities(
+    conn: &Connection,
+    start_time: i64,
+    end_time: i64,
+    title_keywords: &[&str],
+    category_ids: &[i32],
+    limit: Option<i32>,
+) -> Result<Vec<Activity>> {
+    let limit_clause = limit.map(|l| format!("LIMIT {}", l)).unwrap_or_default();
+    
+    // Build WHERE conditions for keywords (OR-ed together)
+    let mut conditions = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    
+    // Time range is always param 1 and 2
+    params.push(Box::new(start_time));
+    params.push(Box::new(end_time));
+    
+    let mut keyword_conditions = Vec::new();
+    let mut param_idx = 3;
+    
+    for kw in title_keywords {
+        keyword_conditions.push(format!(
+            "(LOWER(window_title) LIKE ?{} OR LOWER(app_name) LIKE ?{})",
+            param_idx, param_idx
+        ));
+        params.push(Box::new(format!("%{}%", kw.to_lowercase())));
+        param_idx += 1;
+    }
+    
+    if !category_ids.is_empty() {
+        let cat_placeholders: Vec<String> = category_ids.iter().enumerate().map(|(i, _)| {
+            format!("?{}", param_idx + i)
+        }).collect();
+        keyword_conditions.push(format!("category_id IN ({})", cat_placeholders.join(",")));
+        for cat in category_ids {
+            params.push(Box::new(*cat));
+        }
+    }
+    
+    if !keyword_conditions.is_empty() {
+        conditions.push(format!("({})", keyword_conditions.join(" OR ")));
+    }
+    
+    let extra_where = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("AND {}", conditions.join(" AND "))
+    };
+    
+    let sql = format!(
+        "SELECT id, app_name, app_hash, window_title, window_title_hash, 
+                category_id, start_time, end_time, duration_seconds, metadata
+         FROM activities 
+         WHERE start_time >= ?1 AND end_time <= ?2 
+         {} 
+         ORDER BY start_time DESC 
+         {}",
+        extra_where, limit_clause
+    );
+    
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    
+    let activities = stmt.query_map(param_refs.as_slice(), |row| {
+        Ok(Activity {
+            id: row.get(0)?,
+            app_name: row.get(1)?,
+            app_hash: row.get::<_, i64>(2)? as u64,
+            window_title: row.get::<_, String>(3).unwrap_or_default(),
+            window_title_hash: row.get::<_, i64>(4).unwrap_or(0) as u64,
             category_id: row.get(5)?,
             start_time: row.get(6)?,
             end_time: row.get(7)?,
@@ -116,6 +202,7 @@ pub fn get_activity_stats(
     })
 }
 
+#[allow(dead_code)]
 pub fn insert_activity(conn: &Connection, activity: &crate::models::ActivityEvent) -> Result<i64> {
     let _metadata = serde_json::to_vec(&activity.metadata)?;
     

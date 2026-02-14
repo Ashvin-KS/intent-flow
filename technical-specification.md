@@ -258,11 +258,13 @@ PRAGMA foreign_keys = ON;
   },
   "ai": {
     "enabled": true,
-    "provider": "openai",
-    "api_key": "",
-    "model": "gpt-4o-mini",
+    "provider": "nvidia",
+    "api_key": "nvapi-...",
+    "model": "moonshotai/kimi-k2.5",
+    "base_url": "https://integrate.api.nvidia.com/v1",
     "local_only": false,
-    "fallback_to_local": true
+    "fallback_to_local": true,
+    "max_tokens": 512
   },
   "privacy": {
     "encrypt_database": false,
@@ -388,20 +390,12 @@ PRAGMA foreign_keys = ON;
 ```json
 {
   "providers": {
-    "openai": {
+    "nvidia": {
       "enabled": true,
-      "api_key": "",
-      "base_url": "https://api.openai.com/v1",
-      "model": "gpt-4o-mini",
-      "max_tokens": 500,
-      "temperature": 0.7
-    },
-    "anthropic": {
-      "enabled": false,
-      "api_key": "",
-      "base_url": "https://api.anthropic.com/v1",
-      "model": "claude-3-haiku-20240307",
-      "max_tokens": 500,
+      "api_key": "nvapi-...",
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "model": "moonshotai/kimi-k2.5",
+      "max_tokens": 512,
       "temperature": 0.7
     }
   },
@@ -481,7 +475,7 @@ CREATE TABLE activities (
     start_time INTEGER NOT NULL,      -- Unix timestamp
     end_time INTEGER NOT NULL,        -- Unix timestamp
     duration_seconds INTEGER NOT NULL,
-    metadata BLOB,                    -- Compressed JSON metadata
+    metadata BLOB,                    -- Compressed JSON: {is_idle, screen_text, media_info: {title, artist, status}}
     FOREIGN KEY (category_id) REFERENCES categories(id)
 );
 
@@ -634,7 +628,7 @@ CREATE INDEX idx_app_registry_app_hash ON app_registry(app_hash);
 | start_time | INTEGER | 8 bytes | Unix timestamp |
 | end_time | INTEGER | 8 bytes | Unix timestamp |
 | duration_seconds | INTEGER | 4 bytes | |
-| metadata | BLOB | Variable | Compressed JSON |
+| metadata | BLOB | Variable | JSON: `{"media_info": {...}, "screen_text": "...", "background_windows": [...]}` |
 | confidence | REAL | 8 bytes | Float 0.0-1.0 |
 
 ---
@@ -882,6 +876,8 @@ fn create_hourly_summary(
 - Poll active window every 5 seconds
 - Detect idle state (no mouse/keyboard for 5 minutes)
 - Categorize activities
+
+- Track background media via SMTC (Spotify, YouTube)
 - Send events to LTM storage
 
 **Configuration**:
@@ -926,6 +922,14 @@ pub struct ActivityMetadata {
     pub is_fullscreen: bool,
     pub process_id: Option<u32>,
     pub url: Option<String>,  // For browser activities
+    pub media_info: Option<MediaInfo>, // Background music/video
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaInfo {
+    pub title: String,
+    pub artist: String,
+    pub status: String,
 }
 ```
 
@@ -957,42 +961,106 @@ impl LTMStorage {
 }
 ```
 
-### 3. Query Engine Service
+### 3. AI Query Engine Service
 
-**File**: `src-tauri/src/services/query_engine.rs`
+**File**: `src-tauri/src/commands/query.rs`
 
 **Responsibilities**:
-- Parse natural language queries
-- Search activities and summaries
-- Format results with timestamps
-- Cache query results
+- Parse natural language queries with typo tolerance
+- Determine time range from query context
+- Fetch activities from SQLite (all for single-day, filtered for multi-day)
+- Build structured data summaries for AI consumption
+- Send query + data to NVIDIA NIM API (Kimi-K2.5) for analysis
+- Return conversational AI response with activity timeline
+- Cache results and maintain query history
 
-**Query Types**:
+**Two-Tier Query Strategy**:
+- **Single-day queries** (today, yesterday): Load ALL activities, send to AI for full-context analysis
+- **Multi-day queries** (this week, last month): Use `extract_search_hints()` to derive keywords/categories, then `search_activities()` for SQL-level filtering before AI
+
+**Query Result Structure** (actual implementation):
 ```rust
-pub enum QueryType {
-    TimeRange { start: i64, end: i64 },
-    AppUsage { app_name: String },
-    CategoryUsage { category: String },
-    SpecificQuestion { question: String },
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QueryResult {
     pub query: String,
     pub results: Vec<QueryItem>,
-    pub summary: String,
+    pub summary: String,      // AI-generated conversational response
     pub timestamp: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QueryItem {
     pub timestamp: i64,
-    pub time_str: String,  // Formatted: "2:45 PM"
-    pub activity: String,
-    pub duration: String,  // Formatted: "2h 30m"
+    pub time_str: String,      // "9:45 PM" (local timezone)
+    pub activity: String,      // "App - Window Title"
+    pub duration: String,      // "2h 30m"
     pub details: Option<String>,
 }
 ```
+
+**AI Request Pipeline**:
+```rust
+async fn ai_summarize_query(
+    query: &str,
+    structured_data: &str,   // Aggregated stats + timeline
+    api_key: &str,
+    model: &str,             // "moonshotai/kimi-k2.5"
+) -> Result<String, String>
+```
+
+**Structured Data Format** (sent to AI):
+```
+=== Today's activity ===
+Total tracked: 4h 23m
+
+--- Time per App ---
+Brave Browser: 1h 45m
+Antigravity: 1h 30m
+WhatsApp: 42m
+...
+
+--- Time per Category ---
+Development: 1h 30m
+Browser: 1h 45m
+Communication: 42m
+
+--- Recent Timeline (last 50) ---
+[09:55 PM] Antigravity - query.rs (5s)
+[09:54 PM] WhatsApp - WhatsApp (10s)
+...
+```
+
+**Time Range Parser** (`parse_query_time_range`):
+| Input | Parsed Range |
+|-------|-------------|
+| "yesterday" (+ typos: yesteray, yeterday, etc.) | Yesterday 00:00 - 23:59 |
+| "last week", "past week" | 7 days ago → now |
+| "this week" | Monday → now |
+| "last 3 hours" | N hours ago → now |
+| "monday", "tuesday", etc. | Last occurrence of that day |
+| "this morning" | Today 06:00 - 12:00 |
+| "this afternoon" | Today 12:00 - 17:00 |
+| "this evening" | Today 17:00 - 23:59 |
+| "2 days ago" | That day 00:00 - 23:59 |
+| anything else | Defaults to today |
+
+**Semantic Search Hints** (`extract_search_hints`):
+```rust
+struct SearchHints {
+    keywords: Vec<String>,
+    category_ids: Vec<i32>,
+}
+// "songs I listened to" → keywords: [spotify, soundcloud, •], categories: [4]
+// "coding today" → keywords: [code, terminal, git], categories: [1]
+```
+
+**App Alias Expansion** (`expand_app_aliases`):
+| User says | Matches |
+|-----------|--------|
+| "vs code" | "visual studio code", "code" |
+| "chrome" | "chrome", "google chrome" |
+| "brave" | "brave", "brave browser" |
+| "whatsapp" | "whatsapp", "whatsapp.root" |
 
 ### 4. Pattern Recognition Engine
 

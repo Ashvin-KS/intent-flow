@@ -17,6 +17,15 @@ export interface ActivityMetadata {
   is_fullscreen: boolean;
   process_id?: number;
   url?: string;
+  screen_text?: string;
+  background_windows?: string[];
+  media_info?: MediaInfo;
+}
+
+export interface MediaInfo {
+  title: string;
+  artist: string;
+  status: string;
 }
 
 export interface ActivityStats {
@@ -79,15 +88,15 @@ export interface PatternData {
   hour?: number;
   day_of_week?: number;
   likely_activities?: string[];
-  
+
   // Sequence pattern
   sequence?: string[];
   avg_gap_seconds?: number;
-  
+
   // Context pattern
   trigger_activity?: string;
   following_activities?: string[];
-  
+
   // Mood pattern
   idle_duration?: number;
   time_of_day?: number;
@@ -102,13 +111,13 @@ export interface Intent {
   suggested_actions: Action[];
 }
 
-export type IntentType = 
-  | 'work_start' 
-  | 'entertainment' 
-  | 'focus' 
-  | 'learning' 
-  | 'wind_down' 
-  | 'query' 
+export type IntentType =
+  | 'work_start'
+  | 'entertainment'
+  | 'focus'
+  | 'learning'
+  | 'wind_down'
+  | 'query'
   | 'unknown';
 
 export interface Action {
@@ -117,12 +126,12 @@ export interface Action {
   args: string[];
 }
 
-export type ActionType = 
-  | 'launch_app' 
-  | 'open_url' 
-  | 'open_file' 
-  | 'close_app' 
-  | 'show_notification' 
+export type ActionType =
+  | 'launch_app'
+  | 'open_url'
+  | 'open_file'
+  | 'close_app'
+  | 'show_notification'
   | 'execute_workflow';
 
 // Workflow types

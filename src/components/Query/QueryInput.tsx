@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Search, Loader2, Send } from 'lucide-react';
+import { useState } from 'react';
+import { Search, Send } from 'lucide-react';
 import { Button } from '../common';
 import { executeQuery } from '../../services/tauri';
 import type { QueryResult } from '../../types';

@@ -1,17 +1,22 @@
-import React, { useState, useEffect } from 'react';
-import { 
-  Activity, 
-  Clock, 
-  TrendingUp, 
+import { useState, useEffect } from 'react';
+import {
+  Activity,
+  Clock,
+  TrendingUp,
   Zap,
   Settings,
   History,
   Target,
-  BarChart3
+  BarChart3,
+
 } from 'lucide-react';
 import { Card, CardHeader, CardContent, Button } from '../common';
 import { QueryInput } from '../Query/QueryInput';
 import { QueryResults } from '../Query/QueryResults';
+import { IntentInput } from '../QuickActions/IntentInput';
+import { Timeline } from '../Timeline/Timeline';
+import { WorkflowList } from '../Workflows/WorkflowList';
+import { SettingsPanel } from '../Settings/Settings';
 import { getActivityStats, getWorkflowSuggestions } from '../../services/tauri';
 import type { ActivityStats, WorkflowSuggestion, QueryResult } from '../../types';
 import { formatDuration, getDayRange } from '../../lib/utils';
@@ -64,17 +69,16 @@ export function Dashboard() {
               </div>
               <h1 className="text-xl font-bold text-white">IntentFlow</h1>
             </div>
-            
+
             <nav className="flex items-center gap-1">
               {tabs.map((tab) => (
                 <button
                   key={tab.id}
                   onClick={() => setActiveTab(tab.id)}
-                  className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                    activeTab === tab.id
-                      ? 'bg-primary-600 text-white'
-                      : 'text-dark-300 hover:text-white hover:bg-dark-800'
-                  }`}
+                  className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${activeTab === tab.id
+                    ? 'bg-primary-600 text-white'
+                    : 'text-dark-300 hover:text-white hover:bg-dark-800'
+                    }`}
                 >
                   <tab.icon className="w-4 h-4" />
                   {tab.label}
@@ -96,30 +100,10 @@ export function Dashboard() {
             queryResult={queryResult}
           />
         )}
-        
-        {activeTab === 'timeline' && (
-          <div className="text-center py-12 text-dark-400">
-            <History className="w-12 h-12 mx-auto mb-4 opacity-50" />
-            <p className="text-lg">Timeline View</p>
-            <p className="text-sm mt-1">Coming soon</p>
-          </div>
-        )}
-        
-        {activeTab === 'workflows' && (
-          <div className="text-center py-12 text-dark-400">
-            <Zap className="w-12 h-12 mx-auto mb-4 opacity-50" />
-            <p className="text-lg">Workflows</p>
-            <p className="text-sm mt-1">Coming soon</p>
-          </div>
-        )}
-        
-        {activeTab === 'settings' && (
-          <div className="text-center py-12 text-dark-400">
-            <Settings className="w-12 h-12 mx-auto mb-4 opacity-50" />
-            <p className="text-lg">Settings</p>
-            <p className="text-sm mt-1">Coming soon</p>
-          </div>
-        )}
+
+        {activeTab === 'timeline' && <Timeline />}
+        {activeTab === 'workflows' && <WorkflowList />}
+        {activeTab === 'settings' && <SettingsPanel />}
       </main>
     </div>
   );
@@ -150,6 +134,14 @@ function DashboardContent({
 
   return (
     <div className="space-y-6">
+      {/* Intent Input */}
+      <Card variant="bordered">
+        <CardHeader title="Quick Actions" subtitle="Tell IntentFlow what you want to do" />
+        <CardContent>
+          <IntentInput />
+        </CardContent>
+      </Card>
+
       {/* Query Section */}
       <Card variant="bordered">
         <CardHeader title="Ask Anything" subtitle="Query your activity history" />
@@ -239,8 +231,8 @@ function DashboardContent({
       {/* Workflow Suggestions */}
       {suggestions.length > 0 && (
         <Card variant="bordered">
-          <CardHeader 
-            title="Suggested Workflows" 
+          <CardHeader
+            title="Suggested Workflows"
             subtitle="Based on your patterns"
             action={
               <Button variant="ghost" size="sm">

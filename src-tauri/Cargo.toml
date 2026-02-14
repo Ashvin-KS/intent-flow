@@ -31,6 +31,15 @@ log = "0.4"
 env_logger = "0.11"
 active-win-pos-rs = "0.8"
 open = "5"
+xcap = "0.0.14"
+windows = { version = "0.58", features = [
+    "Media_Ocr",
+    "Media_Control",
+    "Graphics_Imaging",
+    "Storage",
+    "Storage_Streams",
+    "Foundation",
+] }
 
 [features]
 default = ["custom-protocol"]

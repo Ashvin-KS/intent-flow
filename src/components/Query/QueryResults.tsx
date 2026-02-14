@@ -1,7 +1,6 @@
-import React from 'react';
 import { Clock, ArrowRight } from 'lucide-react';
 import type { QueryResult, QueryItem } from '../../types';
-import { formatTime, formatDate } from '../../lib/utils';
+import { formatDate } from '../../lib/utils';
 
 interface QueryResultsProps {
   result: QueryResult | null;

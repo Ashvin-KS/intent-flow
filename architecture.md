@@ -8,16 +8,18 @@
 
 ## Core Features
 
-| Feature | Description |
-|---------|-------------|
-| Activity Tracking | Automatically tracks apps, files, websites, and time spent |
-| Manual Entries | Tasks, notes, goals that you log yourself |
-| Pattern Recognition | Learns your lifestyle and work patterns |
-| Intent-Based Actions | Responds to natural language like "I'm bored" or "webdev time" |
-| Quick Launch | Opens relevant apps based on context and intent |
-| LTM Storage | Efficient long-term memory with compression and summarization |
-| Query Engine | Ask anything about your history with timestamped responses |
-| Workflow Suggestions | AI-suggested workflows based on your patterns |
+| Feature | Status | Description |
+|---------|--------|-------------|
+| Activity Tracking | ✅ Live | Tracks active window, app name, title every 5s with auto-categorization |
+| AI Query Engine | ✅ Live | Natural language queries analyzed by AI (NVIDIA API / Kimi-K2.5) |
+| Intent Parsing | ✅ Live | AI-powered intent detection for quick actions |
+| Screenshot & OCR | ✅ Live | Periodic screen capture with text extraction for deeper context |
+| Background Media | ✅ Live | Tracks music/video via Windows SMTC API (Spotify, YouTube, etc.) |
+| Manual Entries | ✅ Live | Tasks, notes, goals with tags |
+| Quick Launch | ✅ Live | Opens relevant apps based on context and intent |
+| LTM Storage | ✅ Live | SQLite with ZSTD compression, deduplication, hash indexing |
+| Workflow Suggestions | ✅ Live | AI-suggested workflows based on your patterns |
+| Typo-Tolerant Parsing | ✅ Live | Handles misspellings in time queries ("yesteray" → yesterday) |
 
 ---
 
@@ -27,7 +29,7 @@
 flowchart TB
     subgraph Frontend[React Frontend - TypeScript]
         UI[Dashboard UI]
-        Timeline[Timeline View]
+        Timeline[Timeline View + Now Playing]
         QuickActions[Quick Actions Panel]
         QueryInput[Query Input - Ask Anything]
         WorkflowSug[Workflow Suggestions]
@@ -42,11 +44,11 @@ flowchart TB
 
     subgraph Backend[Rust Backend]
         ActivityTracker[Activity Tracker Service]
+        ScreenCapture[Screenshot & OCR Service]
         LTMStorage[LTM Storage Engine]
-        QueryEngine[Query Engine]
-        PatternEngine[Pattern Recognition Engine]
-        IntentParser[Intent Parser]
-        WorkflowEngine[Workflow Suggestion Engine]
+        QueryEngine[AI Query Engine]
+        IntentParser[AI Intent Parser]
+        WorkflowEngine[Workflow Engine]
         ActionExecutor[Action Executor]
         StartupManager[Windows Startup Manager]
     end
@@ -58,8 +60,9 @@ flowchart TB
     end
 
     subgraph External[External Services]
-        CloudAI[Cloud AI APIs - Optional]
+        NvidiaAI[NVIDIA AI API - Kimi-K2.5]
         WindowsAPI[Windows APIs]
+        OCREngine[Windows OCR / Tesseract]
     end
 
     UI --> Commands
@@ -72,21 +75,19 @@ flowchart TB
     Commands --> ActivityTracker
     Commands --> LTMStorage
     Commands --> QueryEngine
-    Commands --> PatternEngine
     Commands --> IntentParser
     Commands --> WorkflowEngine
     Commands --> ActionExecutor
 
     ActivityTracker --> WindowsAPI
     ActivityTracker --> LTMStorage
+    ScreenCapture --> OCREngine
+    ScreenCapture --> LTMStorage
     LTMStorage --> SQLite
     QueryEngine --> LTMStorage
     QueryEngine --> Cache
-    QueryEngine --> CloudAI
-    PatternEngine --> LTMStorage
-    IntentParser --> CloudAI
-    IntentParser --> PatternEngine
-    WorkflowEngine --> PatternEngine
+    QueryEngine --> NvidiaAI
+    IntentParser --> NvidiaAI
     WorkflowEngine --> LTMStorage
     ActionExecutor --> WindowsAPI
     StartupManager --> WindowsAPI
@@ -100,53 +101,70 @@ flowchart TB
 
 ### 1. Activity Tracker Service
 
-**Purpose**: Runs in background to collect activity data
+**Purpose**: Runs in background every 5 seconds to collect activity data
 
-**Responsibilities**:
-- Track active window and application
-- Monitor file open/save operations
-- Track browser tabs and URLs
-- Record time spent on each activity
-- Categorize activities automatically
+**Implementation**: `src-tauri/src/services/activity_tracker.rs`
 
-**Tech**: Rust with Windows APIs
+**How it works**:
+1. Polls active window via `active-win-pos-rs` crate every 5 seconds
+2. Extracts `app_name` and `window_title` from the foreground window
+3. Auto-categorizes using rule-based `categorize_window()` function
+4. Merges consecutive events with same app/title (deduplication)
+5. **Captures background media** via Windows SMTC API (Artist, Title, Status)
+6. Stores to SQLite with XXH64 hashes for fast lookups
+7. **Error resilience**: spawn_blocking failures logged, never silently swallowed
+
+**Activity Categories** (priority order):
+| ID | Category | Detection Logic |
+|----|----------|----------------|
+| 1 | Development | App name contains `code`, `cursor`, `idea`, etc. or title has code file extensions |
+| 4 | Entertainment | Title contains `spotify`, `youtube`, `netflix`, or `•` (Spotify format) — checked **before** Browser |
+| 2 | Browser | App name contains `chrome`, `brave`, `firefox`, `edge`, etc. |
+| 3 | Communication | `slack`, `discord`, `teams`, `whatsapp`, `zoom`, etc. |
+| 5 | Productivity | `notion`, `obsidian`, `word`, `excel`, `figma`, etc. |
+| 6 | System | `explorer`, `settings`, `task manager` |
+| 7 | Other | Default fallback |
+
+> **Key design decision**: Entertainment title checks (Spotify "Song • Artist" format, YouTube) run _before_ the generic browser check.
+> **New**: Background media (SMTC) is tracked independently, allowing the AI to know you're listening to music even while coding.
 
 ```mermaid
 flowchart LR
     subgraph Sources[Activity Sources]
-        WinEvents[Windows Events]
-        FileWatcher[File Watcher]
-        BrowserExt[Browser Extension]
+        ActiveWin[active-win-pos-rs]
+        ScreenCap[Screenshot Capture - Planned]
     end
 
     subgraph Tracker[Activity Tracker]
-        EventProcessor[Event Processor]
-        Categorizer[Activity Categorizer]
-        TimeAggregator[Time Aggregator]
+        Categorizer[Rule-Based Categorizer]
+        Dedup[Deduplication via Hash Match]
+        TimeAgg[Time Aggregator - 5s intervals]
     end
 
     subgraph Output[Output]
-        ActivityLog[Activity Log]
-        Statistics[Daily Statistics]
+        SQLite[(SQLite - activities table)]
     end
 
     Sources --> Tracker --> Output
 ```
 
-### 2. Pattern Recognition Engine
+### 2. Screenshot & OCR Service (Live)
 
-**Purpose**: Learn and identify patterns in user behavior
+**Purpose**: Capture screen content periodically and extract text for richer activity context
 
-**Pattern Types**:
-- **Time-based**: "Usually codes from 9 PM to 12 AM"
-- **Sequence-based**: "Opens VS Code → Terminal → Browser when doing webdev"
-- **Context-based**: "Uses Spotify when browsing Reddit"
-- **Mood-based**: "Opens games when idle for 30+ minutes"
+**Design** (5-6 captures/min, non-blocking):
+- Runs on a **separate async task** (not on the UI thread) every ~10-12 seconds
+- Captures the active monitor using `xcap` or `win-screenshot` crate
+- Extracts text via Windows built-in OCR API or `tesseract-rs`
+- Stores extracted text in the `metadata` BLOB of the activity record
+- Only processes the **active window region**, not the full screen, to reduce overhead
+- Implements **content diffing** — skips OCR if the screenshot is visually identical to the last one
 
-**Implementation**:
-- Local ML model for pattern detection
-- Statistical analysis of activity sequences
-- Time-series analysis for daily patterns
+**Performance safeguards**:
+- Async/non-blocking execution via `tokio::spawn`
+- Frame skipping if previous OCR is still running
+- Image downscaling before OCR (720p max)
+- Rate-limited to prevent CPU overload
 
 ### 3. Intent Parser
 
@@ -246,45 +264,69 @@ flowchart TB
 - Monthly storage: ~150MB
 - Yearly storage: ~1.8GB (with summarization)
 
-### 6. Query Engine
+### 6. AI Query Engine
 
-**Purpose**: Answer natural language questions about your history
+**Purpose**: Answer natural language questions about your activity history using AI analysis
 
-**Query Types**:
+**Implementation**: `src-tauri/src/commands/query.rs`
+
+**Architecture — Two-Tier Strategy**:
 
 ```mermaid
-flowchart LR
-    subgraph Queries[User Queries]
-        Time[What did I do yesterday?]
-        App[When did I last use Figma?]
-        Pattern[What apps do I use most?]
-        Context[What was I working on before lunch?]
-    end
-
-    subgraph Engine[Query Engine]
-        Parser[NL Parser]
-        TimeFilter[Time Filter]
-        Search[Full-Text Search]
-        Aggregator[Aggregator]
-    end
-
-    subgraph Output[Response]
-        Results[Results with Timestamps]
-        Actions[Suggested Actions]
-    end
-
-    Queries --> Engine --> Output
+flowchart TB
+    Input[User Query] --> TimeParse[Time Range Parser]
+    TimeParse --> Decision{Single day or Multi-day?}
+    
+    Decision -->|Single day| AllData[Load ALL activities for that day]
+    Decision -->|Multi-day| SearchHints[Extract Semantic Hints]
+    SearchHints --> DBFilter[SQL-level keyword + category filter]
+    DBFilter --> FilteredData[Filtered activities]
+    
+    AllData --> StructuredData[Build Structured Summary]
+    FilteredData --> StructuredData
+    
+    StructuredData --> AI[NVIDIA AI API - Kimi-K2.5]
+    AI --> Response[Conversational AI Response]
+    
+    StructuredData --> Fallback[Fallback Summary]
+    Fallback -.->|AI disabled/error| Response
 ```
 
-**Example Queries & Responses**:
+**Key components**:
 
-| Query | Response |
+| Component | Function |
+|-----------|----------|
+| `parse_query_time_range()` | Typo-tolerant NL time parsing (yesterday, last week, N hours ago, day names, morning/afternoon/evening) |
+| `extract_search_hints()` | Maps query keywords → DB-level filters ("songs" → Spotify/YouTube categories) |
+| `build_structured_data()` | Aggregates per-app time, per-category time, and activity timeline for AI context |
+| `ai_summarize_query()` | Sends structured data + query to NVIDIA API with rich system prompt |
+| `build_fallback_summary()` | Static summary when AI is unavailable |
+| `extract_app_filter()` | Identifies app names in query for timeline filtering |
+| `expand_app_aliases()` | Maps "vs code" → ["visual studio code", "code"], etc. |
+
+**AI Integration**:
+- **Provider**: NVIDIA NIM API (`integrate.api.nvidia.com`)
+- **Model**: `moonshotai/kimi-k2.5` (configurable)
+- **System Prompt**: Rich context about IntentFlow categories, data format, response style
+- **Max Tokens**: 512
+- **Approach**: Agentic — AI receives ALL data and interprets context, handles typos, infers meaning
+
+**Semantic Search Hints** (for multi-day queries):
+| Query keyword | Maps to |
+|--------------|----------|
+| "songs", "music", "listened" | keywords: `spotify`, `soundcloud`, `•` + category 4 |
+| "coding", "programming" | keywords: `code`, `terminal`, `git` + category 1 |
+| "chatting", "messages" | keywords: `whatsapp`, `discord`, `slack` + category 3 |
+| "browsing", "websites" | keywords: `chrome`, `brave`, `firefox` + category 2 |
+
+**Example Queries & AI Responses**:
+
+| Query | AI Response Style |
 |-------|----------|
-| "What did I do yesterday?" | Timeline of activities with timestamps |
-| "When did I last open project X?" | "You opened project X 2 hours ago at 3:45 PM" |
-| "What websites did I visit this morning?" | List of URLs with time spent |
-| "How much time did I spend coding today?" | "4 hours 23 minutes across VS Code and Terminal" |
-| "What was I doing before the meeting?" | Activities 30 mins before calendar event |
+| "What did I do yesterday?" | Conversational summary with time blocks and key activities |
+| "What websites did I visit this morning?" | Lists specific sites, times, and durations naturally |
+| "What songs did I listen to this month?" | Multi-day search → DB filter for Spotify/music → AI summary |
+| "How productive was I today?" | AI analyzes dev vs entertainment ratio, gives insights |
 
 ### 7. Workflow Suggestion System
 
@@ -533,14 +575,20 @@ intentflow/
 
 | Layer | Technology | Purpose |
 |-------|------------|---------|
-| Frontend | React + TypeScript | UI components |
-| Styling | Tailwind CSS | Responsive design |
-| Build Tool | Vite | Fast development |
-| Backend | Rust + Tauri | Native performance |
-| Database | SQLite | Local data storage |
-| ML/Pattern | Rust ML crates | Local pattern recognition |
-| Cloud AI | OpenAI API | Optional enhanced intent parsing |
-| Windows APIs | winapi crate | System integration |
+| Frontend | React 18 + TypeScript | UI components |
+| Styling | Tailwind CSS 3 | Responsive design |
+| Build Tool | Vite 5 | Fast development |
+| Backend | Rust + Tauri 2 | Native performance |
+| Database | SQLite (rusqlite 0.31) | Local data storage |
+| AI Provider | NVIDIA NIM API | Query analysis & intent parsing |
+| AI Model | `moonshotai/kimi-k2.5` | Conversational activity analysis |
+| Window Tracking | `active-win-pos-rs` | Active window detection |
+| Compression | `zstd` 0.13 | ZSTD metadata compression |
+| Hashing | `twox-hash` 1.6 | XXH64 fast deduplication hashes |
+| HTTP Client | `reqwest` 0.12 | AI API calls |
+| Windows APIs | `winapi` 0.3 | System integration |
+| Screenshot (planned) | `xcap` / `win-screenshot` | Periodic screen capture |
+| OCR (planned) | `tesseract-rs` / Windows OCR | Text extraction from screenshots |
 
 ---
 
@@ -549,22 +597,27 @@ intentflow/
 ### Rust (Cargo.toml)
 ```toml
 [dependencies]
-tauri = { version = "2", features = ["system-tray", "autostart"] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }
-winapi = "0.3"
-active-win-pos-rs = "0.8"
+winapi = { version = "0.3", features = ["winuser", "processthreadsapi", "handleapi", "psapi"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
 zstd = "0.13"                    # ZSTD compression
 bincode = "1.3"                  # Binary serialization
-twox-hash = "1.6"                # Fast hashing
-regex = "1.10"                   # Pattern matching
+twox-hash = "1.6"                # XXH64 fast hashing
+regex = "1.10"                   # NL query pattern matching
 chrono-tz = "0.8"                # Timezone support
+anyhow = "1.0"                   # Error handling
+thiserror = "1.0"                # Typed errors
+log = "0.4"                      # Logging facade
+env_logger = "0.11"              # Logger implementation
+active-win-pos-rs = "0.8"        # Active window detection
+open = "5"                       # Open URLs/files
 ```
 
 ### Frontend (package.json)
@@ -687,80 +740,43 @@ fn main() {
 
 ## Development Phases
 
-### Phase 1: Foundation
-- Set up Tauri + React project
-- Implement basic activity tracking
-- Create database schema with compression
-- Build minimal UI
+### Phase 1: Foundation ✅
+- Tauri 2 + React 18 + Vite project setup
+- SQLite database schema with WAL mode
+- Activity tracker service (5s polling loop)
+- Rule-based categorization engine
+- Basic dashboard UI
 
-### Phase 2: Core Features
-- Complete activity tracker
-- Implement LTM storage with compression
-- Build timeline view
-- Implement manual entries
-- Add system tray
+### Phase 2: Core Features ✅
+- Full activity tracker with deduplication
+- LTM storage with ZSTD compression
+- Timeline view with activity cards
+- Manual entries (tasks, notes, goals)
+- System tray with autostart
+- Settings panel (General, Tracking, Storage, AI, Privacy)
 
-### Phase 3: Intelligence
-- Pattern recognition engine
-- Intent parser with local matching
-- Query engine for natural language questions
-- Action executor
+### Phase 3: Intelligence ✅
+- AI-powered query engine via NVIDIA NIM API
+- Two-tier query strategy (single-day agentic vs multi-day filtered)
+- AI intent parser for quick actions
+- Semantic search hints (`extract_search_hints`)
+- Typo-tolerant time parsing
+- App alias expansion
+- Smart category detection (Spotify/YouTube → Entertainment before Browser)
 
-### Phase 4: Enhancement
-- Cloud AI integration
-- Workflow suggestion system
-- Advanced patterns
-- Workflow automation
-- Settings and customization
-
----
-
-## Implementation Workflow
-
-```mermaid
-flowchart LR
-    subgraph Phase1[Phase 1: Foundation]
-        A1[Setup Tauri + React]
-        A2[Database Schema]
-        A3[Basic Activity Tracker]
-        A4[Minimal UI]
-    end
-
-    subgraph Phase2[Phase 2: Core Features]
-        B1[LTM Storage]
-        B2[Timeline View]
-        B3[Manual Entries]
-        B4[System Tray]
-    end
-
-    subgraph Phase3[Phase 3: Intelligence]
-        C1[Pattern Engine]
-        C2[Intent Parser]
-        C3[Query Engine]
-        C4[Action Executor]
-    end
-
-    subgraph Phase4[Phase 4: Enhancement]
-        D1[Cloud AI]
-        D2[Workflow Suggestions]
-        D3[Advanced Features]
-        D4[Polish and Test]
-    end
-
-    Phase1 --> Phase2 --> Phase3 --> Phase4
-```
+### Phase 4: Enhancement 🔜
+- Screenshot capture service (every 10-12s)
+- OCR text extraction from screenshots
+- Enhanced metadata storage with screen text
+- Cross-day activity insights
+- Advanced pattern recognition
 
 ---
 
 ## Next Steps
 
-1. Initialize Tauri + React project
-2. Set up database schema with compression
-3. Implement activity tracker service
-4. Build basic UI components
-5. Add LTM storage system
-6. Implement query engine
-7. Add intent parsing
-8. Build workflow suggestion system
-
-Ready to proceed with implementation?
+1. **Screenshot & OCR** — Add periodic screen capture with text extraction
+2. **Dead code cleanup** — Remove unused functions flagged by compiler
+3. **API key security** — Move hardcoded key to environment variable
+4. **Advanced patterns** — Time-series analysis for daily routines
+5. **Data export** — Allow users to export activity history

@@ -26,6 +26,9 @@ fn main() {
             // Start activity tracker
             services::activity_tracker::start_tracking(app_handle.clone());
             
+            // Start screen capture + OCR service (every ~10s, non-blocking)
+            services::screen_capture::start_screen_capture(app_handle.clone());
+            
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

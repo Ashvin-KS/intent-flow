@@ -102,9 +102,9 @@ impl Default for AISettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            provider: "openai".to_string(),
-            api_key: String::new(),
-            model: "gpt-4o-mini".to_string(),
+            provider: "nvidia".to_string(),
+            api_key: "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".to_string(),
+            model: "moonshotai/kimi-k2-instruct-0905".to_string(),
             local_only: false,
             fallback_to_local: true,
         }

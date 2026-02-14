@@ -6,6 +6,16 @@ pub struct ActivityMetadata {
     pub is_fullscreen: bool,
     pub process_id: Option<u32>,
     pub url: Option<String>,
+    pub screen_text: Option<String>,
+    pub background_windows: Option<Vec<String>>,
+    pub media_info: Option<MediaInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct MediaInfo {
+    pub title: String,
+    pub artist: String,
+    pub status: String, // "Playing", "Paused", "Stopped"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +105,9 @@ impl ActivityEvent {
                 is_fullscreen: false,
                 process_id: None,
                 url: None,
+                screen_text: None,
+                background_windows: None,
+                media_info: None,
             },
         }
     }
