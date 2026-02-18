@@ -11,6 +11,8 @@ import type {
   QueryResult,
   Settings,
   StorageStats,
+  ChatSession,
+  ChatMessage,
 } from '../types';
 
 // Activity commands
@@ -127,6 +129,15 @@ export async function updateCategories(categories: Category[]): Promise<void> {
   return invoke('update_categories', { categories });
 }
 
+export interface ModelInfo {
+  id: string;
+  name: string;
+}
+
+export async function getNvidiaModels(apiKey: string): Promise<ModelInfo[]> {
+  return invoke('get_nvidia_models', { apiKey });
+}
+
 // Storage commands
 export async function getStorageStats(): Promise<StorageStats> {
   return invoke('get_storage_stats');
@@ -152,3 +163,25 @@ export async function showWindow(): Promise<void> {
 export async function quitApp(): Promise<void> {
   return invoke('quit_app');
 }
+
+// Chat commands
+export async function createChatSession(): Promise<ChatSession> {
+  return invoke('create_chat_session');
+}
+
+export async function getChatSessions(): Promise<ChatSession[]> {
+  return invoke('get_chat_sessions');
+}
+
+export async function deleteChatSession(sessionId: string): Promise<void> {
+  return invoke('delete_chat_session', { sessionId });
+}
+
+export async function getChatMessages(sessionId: string): Promise<ChatMessage[]> {
+  return invoke('get_chat_messages', { sessionId });
+}
+
+export async function sendChatMessage(sessionId: string, message: string): Promise<ChatMessage> {
+  return invoke('send_chat_message', { sessionId, message });
+}
+

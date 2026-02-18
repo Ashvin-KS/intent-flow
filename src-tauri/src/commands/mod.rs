@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod app_control;
+pub mod chat;
 pub mod entry;
 pub mod intent;
 pub mod query;

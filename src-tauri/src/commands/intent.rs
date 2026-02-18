@@ -96,7 +96,7 @@ pub async fn parse_intent(
     }
     
     // Fallback to local keyword matching
-    Ok(local_parse_intent(&input))
+    Ok(local_parse_intent(&app_handle, &input).await)
 }
 
 async fn ai_parse_intent(input: &str, api_key: &str, model: &str) -> Result<Intent, String> {
@@ -194,9 +194,25 @@ async fn ai_parse_intent(input: &str, api_key: &str, model: &str) -> Result<Inte
     })
 }
 
-fn local_parse_intent(input: &str) -> Intent {
+async fn local_parse_intent(app_handle: &AppHandle, input: &str) -> Intent {
     let input_lower = input.to_lowercase();
     
+    // 1. Check for Pattern-based intents (Dynamic)
+    // If input contains "work", check if we have a "time_of_day" pattern for now
+    if input_lower.contains("work") || input_lower.contains("start") {
+         if let Ok(suggestions) = check_time_patterns(app_handle).await {
+             if !suggestions.is_empty() {
+                 return Intent {
+                     intent_type: IntentType::WorkStart,
+                     confidence: 0.95,
+                     parameters: HashMap::new(),
+                     suggested_actions: suggestions,
+                 };
+             }
+         }
+    }
+
+    // 2. Hardcoded fallback (existing logic)
     let (intent_type, confidence, actions) = if 
         input_lower.contains("bored") || 
         input_lower.contains("break") ||
@@ -290,6 +306,58 @@ fn local_parse_intent(input: &str) -> Intent {
         parameters: HashMap::new(),
         suggested_actions: actions,
     }
+}
+
+async fn check_time_patterns(app_handle: &AppHandle) -> Result<Vec<Action>, String> {
+    let data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+    let db_path = data_dir.join("intentflow.db");
+    let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+    
+    // Get current hour
+    let now = chrono::Local::now();
+    let current_hour = now.format("%H").to_string().parse::<u32>().unwrap_or(9);
+
+    let mut stmt = conn.prepare(
+        "SELECT pattern_data FROM patterns 
+         WHERE pattern_type = 'time_of_day' AND is_active = 1"
+    ).map_err(|e| e.to_string())?;
+    
+    let rows = stmt.query_map([], |row| {
+        let blob: Vec<u8> = row.get(0)?;
+        Ok(blob)
+    }).map_err(|e| e.to_string())?;
+    
+    let mut actions = Vec::new();
+    
+    for blob in rows {
+        if let Ok(data) = blob {
+           // Parse JSON manually or use a struct
+           if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&data) {
+               if let Some(h) = value.get("hour").and_then(|v| v.as_u64()) {
+                   if h as u32 == current_hour {
+                       if let Some(app) = value.get("app_name").and_then(|v| v.as_str()) {
+                           actions.push(Action {
+                               action_type: ActionType::LaunchApp,
+                               target: app.to_string(),
+                               args: vec![],
+                           });
+                       }
+                   }
+               }
+           }
+        }
+    }
+    
+    if !actions.is_empty() {
+        // Add a notification explaining why
+        actions.insert(0, Action {
+            action_type: ActionType::ShowNotification,
+            target: "Routine Detected".to_string(),
+            args: vec![format!("It's {} - usually you use these apps:", now.format("%I %p"))], 
+        });
+    }
+    
+    Ok(actions)
 }
 
 fn load_settings(app_handle: &AppHandle) -> Option<Settings> {

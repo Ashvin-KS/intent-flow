@@ -19,7 +19,8 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }
 winapi = { version = "0.3", features = ["winuser", "processthreadsapi", "handleapi", "psapi"] }
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
 zstd = "0.13"
 bincode = "1.3"
 twox-hash = "1.6"
@@ -31,6 +32,7 @@ log = "0.4"
 env_logger = "0.11"
 active-win-pos-rs = "0.8"
 open = "5"
+image = "0.25"
 xcap = "0.0.14"
 windows = { version = "0.58", features = [
     "Media_Ocr",

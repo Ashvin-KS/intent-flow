@@ -29,6 +29,9 @@ fn main() {
             // Start screen capture + OCR service (every ~10s, non-blocking)
             services::screen_capture::start_screen_capture(app_handle.clone());
             
+            // Start pattern engine (background analysis)
+            services::pattern_engine::start_pattern_engine(app_handle.clone());
+            
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -59,6 +62,7 @@ fn main() {
             commands::settings::update_settings,
             commands::settings::get_categories,
             commands::settings::update_categories,
+            commands::settings::get_nvidia_models,
             // Storage commands
             commands::storage::get_storage_stats,
             commands::storage::cleanup_old_data,
@@ -67,6 +71,12 @@ fn main() {
             commands::app_control::minimize_to_tray,
             commands::app_control::show_window,
             commands::app_control::quit_app,
+            // Chat commands
+            commands::chat::create_chat_session,
+            commands::chat::get_chat_sessions,
+            commands::chat::delete_chat_session,
+            commands::chat::get_chat_messages,
+            commands::chat::send_chat_message,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

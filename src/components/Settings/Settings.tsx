@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
     Settings as SettingsIcon,
     Globe,
@@ -9,14 +9,16 @@ import {
     Bell,
     Save,
     RotateCcw,
-
+    Loader2,
+    RefreshCw,
     Trash2,
     Download,
     CheckCircle2,
+    ChevronDown,
 } from 'lucide-react';
 import { Card, CardHeader, CardContent, Button } from '../common';
 import { useSettings } from '../../hooks/useSettings';
-import { getStorageStats, cleanupOldData, exportData } from '../../services/tauri';
+import { getStorageStats, cleanupOldData, exportData, getNvidiaModels, ModelInfo } from '../../services/tauri';
 import type { Settings as SettingsType, StorageStats } from '../../types';
 import { formatBytes } from '../../lib/utils';
 
@@ -29,6 +31,13 @@ export function SettingsPanel() {
     const [storageStats, setStorageStats] = useState<StorageStats | null>(null);
     const [saveSuccess, setSaveSuccess] = useState(false);
     const [actionMessage, setActionMessage] = useState<string | null>(null);
+    const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
+    const [isLoadingModels, setIsLoadingModels] = useState(false);
+    const [modelsError, setModelsError] = useState<string | null>(null);
+    const [modelSearch, setModelSearch] = useState('');
+    const [showModelDropdown, setShowModelDropdown] = useState(false);
+    const modelInputRef = useRef<HTMLInputElement>(null);
+    const modelDropdownRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
         if (settings) {
@@ -40,6 +49,39 @@ export function SettingsPanel() {
         loadStorageStats();
     }, []);
 
+    // Fetch models when AI tab is active and we have an API key
+    useEffect(() => {
+        if (activeTab === 'ai' && localSettings?.ai.api_key) {
+            loadModels(localSettings.ai.api_key);
+        }
+    }, [activeTab, localSettings?.ai.api_key]);
+
+    // Close dropdown when clicking outside
+    useEffect(() => {
+        const handleClickOutside = (event: MouseEvent) => {
+            if (modelDropdownRef.current && !modelDropdownRef.current.contains(event.target as Node)) {
+                setShowModelDropdown(false);
+            }
+        };
+        document.addEventListener('mousedown', handleClickOutside);
+        return () => document.removeEventListener('mousedown', handleClickOutside);
+    }, []);
+
+    const loadModels = async (apiKey: string) => {
+        if (!apiKey || apiKey.length < 10) return;
+        setIsLoadingModels(true);
+        setModelsError(null);
+        try {
+            const models = await getNvidiaModels(apiKey);
+            setAvailableModels(models);
+        } catch (e) {
+            console.error('Failed to load models:', e);
+            setModelsError('Failed to fetch models. Check your API key.');
+        } finally {
+            setIsLoadingModels(false);
+        }
+    };
+
     const loadStorageStats = async () => {
         try {
             const stats = await getStorageStats();
@@ -48,6 +90,30 @@ export function SettingsPanel() {
             console.error('Failed to load storage stats:', e);
         }
     };
+
+    // Auto-save when AI settings change (debounced)
+    useEffect(() => {
+        if (!localSettings || !settings) return;
+        
+        // Only auto-save AI settings changes (not first load)
+        const aiChanged = localSettings.ai.model !== settings.ai.model ||
+                         localSettings.ai.api_key !== settings.ai.api_key ||
+                         localSettings.ai.enabled !== settings.ai.enabled;
+        
+        if (aiChanged && !isLoading) {
+            const timer = setTimeout(async () => {
+                try {
+                    await updateSettings(localSettings);
+                    setSaveSuccess(true);
+                    setTimeout(() => setSaveSuccess(false), 2000);
+                } catch (e) {
+                    console.error('Auto-save failed:', e);
+                }
+            }, 1000); // Auto-save after 1 second of no changes
+            
+            return () => clearTimeout(timer);
+        }
+    }, [localSettings?.ai, settings?.ai, isLoading]);
 
     const handleSave = async () => {
         if (!localSettings) return;
@@ -336,12 +402,93 @@ export function SettingsPanel() {
                                         placeholder="nvapi-..."
                                         type="password"
                                     />
-                                    <SettingText
-                                        label="Model"
-                                        value={localSettings.ai.model}
-                                        onChange={(v) => update('ai', 'model', v)}
-                                        placeholder="moonshotai/kimi-k2.5"
-                                    />
+                                    <div>
+                                        <div className="flex items-center justify-between mb-1">
+                                            <label className="block text-sm font-medium text-white">Model</label>
+                                            <button
+                                                type="button"
+                                                onClick={() => localSettings?.ai.api_key && loadModels(localSettings.ai.api_key)}
+                                                disabled={isLoadingModels || !localSettings?.ai.api_key}
+                                                className="text-xs text-primary-400 hover:text-primary-300 disabled:opacity-50 flex items-center gap-1"
+                                            >
+                                                {isLoadingModels ? (
+                                                    <Loader2 className="w-3 h-3 animate-spin" />
+                                                ) : (
+                                                    <RefreshCw className="w-3 h-3" />
+                                                )}
+                                                Refresh
+                                            </button>
+                                        </div>
+                                        <div className="relative" ref={modelDropdownRef}>
+                                            <div className="relative">
+                                                <input
+                                                    ref={modelInputRef}
+                                                    type="text"
+                                                    value={availableModels.length > 0 ? modelSearch || localSettings.ai.model : localSettings.ai.model}
+                                                    onChange={(e) => {
+                                                        const value = e.target.value;
+                                                        if (availableModels.length > 0) {
+                                                            setModelSearch(value);
+                                                            setShowModelDropdown(true);
+                                                        }
+                                                        update('ai', 'model', value);
+                                                    }}
+                                                    onFocus={() => {
+                                                        if (availableModels.length > 0) {
+                                                            setShowModelDropdown(true);
+                                                            setModelSearch('');
+                                                        }
+                                                    }}
+                                                    placeholder={availableModels.length > 0 ? "Search models..." : "moonshotai/kimi-k2.5"}
+                                                    className="w-full px-3 py-2 pr-8 bg-dark-800 border border-dark-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+                                                />
+                                                {availableModels.length > 0 && (
+                                                    <ChevronDown className="absolute right-2 top-1/2 -translate-y-1/2 w-4 h-4 text-dark-400 pointer-events-none" />
+                                                )}
+                                            </div>
+                                            {showModelDropdown && availableModels.length > 0 && (
+                                                <div className="absolute z-10 w-full mt-1 max-h-60 overflow-auto bg-dark-800 border border-dark-700 rounded-lg shadow-lg">
+                                                    {availableModels
+                                                        .filter((model) => 
+                                                            modelSearch === '' || 
+                                                            model.id.toLowerCase().includes(modelSearch.toLowerCase()) ||
+                                                            model.name.toLowerCase().includes(modelSearch.toLowerCase())
+                                                        )
+                                                        .map((model) => (
+                                                            <button
+                                                                key={model.id}
+                                                                type="button"
+                                                                onClick={() => {
+                                                                    update('ai', 'model', model.id);
+                                                                    setModelSearch('');
+                                                                    setShowModelDropdown(false);
+                                                                }}
+                                                                className={`w-full px-3 py-2 text-left text-sm hover:bg-dark-700 transition-colors ${
+                                                                    localSettings.ai.model === model.id 
+                                                                        ? 'text-primary-400 bg-dark-700/50' 
+                                                                        : 'text-white'
+                                                                }`}
+                                                            >
+                                                                {model.name}
+                                                            </button>
+                                                        ))}
+                                                    {availableModels.filter((model) => 
+                                                        modelSearch === '' || 
+                                                        model.id.toLowerCase().includes(modelSearch.toLowerCase()) ||
+                                                        model.name.toLowerCase().includes(modelSearch.toLowerCase())
+                                                    ).length === 0 && (
+                                                        <div className="px-3 py-2 text-sm text-dark-400">No models found</div>
+                                                    )}
+                                                </div>
+                                            )}
+                                        </div>
+                                        {modelsError && (
+                                            <p className="text-xs text-red-400 mt-1">{modelsError}</p>
+                                        )}
+                                        {isLoadingModels && (
+                                            <p className="text-xs text-dark-400 mt-1">Loading models...</p>
+                                        )}
+                                    </div>
                                     <SettingToggle
                                         label="Local Only"
                                         description="Only use local processing, no API calls"

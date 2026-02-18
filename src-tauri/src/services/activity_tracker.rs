@@ -58,24 +58,25 @@ pub fn start_tracking(app_handle: AppHandle) {
 
                     // Check if we should merge with last activity
                     if let Some(ref last) = last_activity {
-                        // Merge only if app, window title AND background context (windows + media) are the same
-                        // This ensures that if background music changes, we split into a new activity
+                        // Merge only if app + window title are the same.
+                        // Background music and open windows are CONTEXT, not the activity itself.
+                        // A song changing or a window opening shouldn't split the activity.
                         let is_same_app = last.app_name == activity.app_name && last.window_title == activity.window_title;
-                        let is_same_bg = last.metadata.background_windows == activity.metadata.background_windows;
-                        let is_same_media = last.metadata.media_info == activity.metadata.media_info;
 
-                        if is_same_app && is_same_bg && is_same_media {
-                            // Merge: extend duration, keep LATEST screen_text
-                            // background_windows and media_info are already same, so no need to update
-                            let latest_screen_text = activity.metadata.screen_text.clone()
-                                .or_else(|| last.metadata.screen_text.clone());
-                            
+                        if is_same_app {
+                            // Merge: extend duration, keep LATEST metadata
+                            // (latest screen text, latest media info, latest bg windows)
                             let mut merged = ActivityEvent {
                                 end_time: activity.end_time,
                                 duration_seconds: last.duration_seconds + 5,
                                 ..last.clone()
                             };
-                            merged.metadata.screen_text = latest_screen_text;
+                            // Always keep the freshest metadata snapshot
+                            merged.metadata = activity.metadata;
+                            // But preserve screen_text from last if current is empty
+                            if merged.metadata.screen_text.is_none() {
+                                merged.metadata.screen_text = last.metadata.screen_text.clone();
+                            }
                             
                             last_activity = Some(merged);
                         } else {
@@ -117,7 +118,8 @@ fn get_active_window() -> Result<Option<ActiveWindow>, String> {
     // Use active-win-pos-rs to get the active window
     match active_win_pos_rs::get_active_window() {
         Ok(window) => {
-            let app_name = window.app_name;
+            // Sanitize app_name - remove control characters and normalize
+            let app_name = sanitize_app_name(&window.app_name);
             let title = window.title;
             
             // Categorize the window
@@ -131,6 +133,24 @@ fn get_active_window() -> Result<Option<ActiveWindow>, String> {
         }
         Err(_) => Ok(None),
     }
+}
+
+/// Sanitize app name by removing control characters and normalizing known apps
+fn sanitize_app_name(name: &str) -> String {
+    // Remove control characters (ASCII 0-31) and other non-printable chars
+    let cleaned: String = name.chars()
+        .filter(|c| c.is_ascii() && (*c as u8) >= 32 || !c.is_ascii())
+        .collect();
+    
+    // Normalize known app names
+    let cleaned_lower = cleaned.to_lowercase();
+    
+    // Spotify can appear as "Spotify8FileV" or similar with embedded chars
+    if cleaned_lower.starts_with("spotify") || cleaned.contains("Spotify") {
+        return "Spotify".to_string();
+    }
+    
+    cleaned
 }
 
 fn categorize_window(app_name: &str, title: &str) -> i32 {

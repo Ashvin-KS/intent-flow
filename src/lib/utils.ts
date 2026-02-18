@@ -28,7 +28,13 @@ export function formatDuration(seconds: number): string {
 }
 
 export function formatTime(timestamp: number): string {
+  if (!timestamp || timestamp <= 0) {
+    return 'Unknown time';
+  }
   const date = new Date(timestamp * 1000);
+  if (isNaN(date.getTime())) {
+    return 'Invalid Date';
+  }
   return date.toLocaleTimeString('en-US', {
     hour: 'numeric',
     minute: '2-digit',

@@ -207,9 +207,10 @@ fn build_structured_data(
         let screen_info = if let Some(ref meta) = a.metadata {
             if let Some(ref text) = meta.screen_text {
                 if !text.trim().is_empty() {
-                    // Show first 150 chars of screen text
+                    // Show first ~150 chars of screen text (char-boundary safe)
                     let preview = if text.len() > 150 {
-                        format!(" | Screen: {}...", &text[..150])
+                        let end = text.char_indices().nth(150).map(|(i, _)| i).unwrap_or(text.len());
+                        format!(" | Screen: {}...", &text[..end])
                     } else {
                         format!(" | Screen: {}", text)
                     };
@@ -243,9 +244,10 @@ fn build_structured_data(
                         .unwrap_or_default()
                         .with_timezone(&local_tz);
                     let time_str = dt.format("%I:%M %p").to_string();
-                    // Truncate to 500 chars per entry
+                    // Truncate to ~500 chars per entry (char-boundary safe)
                     let entry_text = if trimmed.len() > 500 {
-                        format!("{}...", &trimmed[..500])
+                        let end = trimmed.char_indices().nth(500).map(|(i, _)| i).unwrap_or(trimmed.len());
+                        format!("{}...", &trimmed[..end])
                     } else {
                         trimmed.clone()
                     };
@@ -439,23 +441,47 @@ pub async fn execute_query(
             time_str,
             activity: format!("{} - {}", a.app_name, a.window_title),
             duration,
-            details: None,
+            details: a.metadata.as_ref().and_then(|m| {
+                // Show media info if playing, or OCR snippet as fallback
+                if let Some(ref media) = m.media_info {
+                    if media.status == "Playing" {
+                        return Some(format!("♫ {} - {}", media.title, media.artist));
+                    }
+                }
+                m.screen_text.as_ref().and_then(|t| {
+                    let trimmed = t.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else if trimmed.len() > 80 {
+                        let end = trimmed.char_indices().nth(80).map(|(i, _)| i).unwrap_or(trimmed.len());
+                        Some(format!("{}...", &trimmed[..end]))
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                })
+            }),
         }
     }).collect();
     
     // AI gets ALL data — it decides what's relevant based on the query
     let settings = load_settings(&app_handle).unwrap_or_default();
+    let category_filter = extract_category_filter(&query);
+    
+    // Default to Agentic Search if AI is enabled
     let adjusted_summary = if settings.ai.enabled && !settings.ai.api_key.is_empty() {
-        match ai_summarize_query(&query, &structured_data, &settings.ai.api_key, &settings.ai.model).await {
-            Ok(ai_summary) => ai_summary,
-            Err(e) => {
-                eprintln!("AI query summary failed: {}", e);
-                let category_filter = extract_category_filter(&query);
-                format!("[AI error: {}] {}", e, build_fallback_summary(&time_label, &app_filter, &category_filter, &all_activities, total_duration))
-            }
+        // Use the new Agentic Engine
+        match crate::services::query_engine::run_agentic_search(&app_handle, &query, &settings).await {
+             Ok(answer) => answer,
+             Err(e) => {
+                 eprintln!("Agentic search failed: {}", e);
+                 // Fallback to old linear summary if agent fails
+                  match ai_summarize_query(&query, &structured_data, &settings.ai.api_key, &settings.ai.model).await {
+                        Ok(linear) => format!("[Agent failed, used linear fallback] {}", linear),
+                        Err(_e2) => format!("[AI Error: {}] {}", e, build_fallback_summary(&time_label, &app_filter, &category_filter, &all_activities, total_duration))
+                  }
+             }
         }
     } else {
-        let category_filter = extract_category_filter(&query);
         build_fallback_summary(&time_label, &app_filter, &category_filter, &all_activities, total_duration)
     };
     

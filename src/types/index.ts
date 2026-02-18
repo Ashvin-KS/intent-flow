@@ -243,3 +243,39 @@ export interface StorageStats {
   oldest_activity: number;
   newest_activity: number;
 }
+
+// Chat types
+export interface ChatSession {
+  id: string;
+  title: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface AgentStep {
+  turn: number;
+  tool_name: string;
+  tool_args: Record<string, any>;
+  tool_result: string;
+  reasoning: string;
+}
+
+export interface ActivityRef {
+  app: string;
+  title: string;
+  time: number;
+  duration_seconds: number;
+  category: string;
+  media?: { title: string; artist: string; status: string } | null;
+  ocr_snippet?: string;
+}
+
+export interface ChatMessage {
+  id: number;
+  session_id: string;
+  role: 'user' | 'assistant' | 'tool';
+  content: string;
+  tool_calls?: AgentStep[];
+  activities?: ActivityRef[];
+  created_at: number;
+}

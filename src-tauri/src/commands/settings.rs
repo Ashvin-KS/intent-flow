@@ -1,5 +1,56 @@
 use tauri::{AppHandle, Manager};
 use crate::models::{Settings, Category};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+}
+
+#[tauri::command]
+pub async fn get_nvidia_models(api_key: String) -> Result<Vec<ModelInfo>, String> {
+    let client = reqwest::Client::new();
+    
+    let response = client
+        .get("https://integrate.api.nvidia.com/v1/models")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch models: {}", e))?;
+    
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("API Error {}: {}", status, text));
+    }
+    
+    #[derive(Deserialize)]
+    struct ModelsResponse {
+        data: Vec<ModelData>,
+    }
+    
+    #[derive(Deserialize)]
+    struct ModelData {
+        id: String,
+    }
+    
+    let models_response: ModelsResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+    
+    let models: Vec<ModelInfo> = models_response
+        .data
+        .into_iter()
+        .map(|m| ModelInfo {
+            id: m.id.clone(),
+            name: m.id,
+        })
+        .collect();
+    
+    Ok(models)
+}
 
 #[tauri::command]
 pub async fn get_settings(
