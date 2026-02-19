@@ -15,17 +15,21 @@ import {
     Download,
     CheckCircle2,
     ChevronDown,
+    Star,
+    X,
 } from 'lucide-react';
 import { Card, CardHeader, CardContent, Button } from '../common';
 import { useSettings } from '../../hooks/useSettings';
 import { getStorageStats, cleanupOldData, exportData, getNvidiaModels, ModelInfo } from '../../services/tauri';
 import type { Settings as SettingsType, StorageStats } from '../../types';
 import { formatBytes } from '../../lib/utils';
+import { useFavoriteModels } from '../../hooks/useFavoriteModels';
 
 type SettingsTab = 'general' | 'tracking' | 'storage' | 'ai' | 'privacy' | 'notifications';
 
 export function SettingsPanel() {
     const { settings, isLoading, isSaving, error, updateSettings } = useSettings();
+    const { favorites, addFavorite, removeFavorite, isFavorite } = useFavoriteModels();
     const [activeTab, setActiveTab] = useState<SettingsTab>('general');
     const [localSettings, setLocalSettings] = useState<SettingsType | null>(null);
     const [storageStats, setStorageStats] = useState<StorageStats | null>(null);
@@ -94,12 +98,12 @@ export function SettingsPanel() {
     // Auto-save when AI settings change (debounced)
     useEffect(() => {
         if (!localSettings || !settings) return;
-        
+
         // Only auto-save AI settings changes (not first load)
         const aiChanged = localSettings.ai.model !== settings.ai.model ||
-                         localSettings.ai.api_key !== settings.ai.api_key ||
-                         localSettings.ai.enabled !== settings.ai.enabled;
-        
+            localSettings.ai.api_key !== settings.ai.api_key ||
+            localSettings.ai.enabled !== settings.ai.enabled;
+
         if (aiChanged && !isLoading) {
             const timer = setTimeout(async () => {
                 try {
@@ -110,7 +114,7 @@ export function SettingsPanel() {
                     console.error('Auto-save failed:', e);
                 }
             }, 1000); // Auto-save after 1 second of no changes
-            
+
             return () => clearTimeout(timer);
         }
     }, [localSettings?.ai, settings?.ai, isLoading]);
@@ -449,8 +453,8 @@ export function SettingsPanel() {
                                             {showModelDropdown && availableModels.length > 0 && (
                                                 <div className="absolute z-10 w-full mt-1 max-h-60 overflow-auto bg-dark-800 border border-dark-700 rounded-lg shadow-lg">
                                                     {availableModels
-                                                        .filter((model) => 
-                                                            modelSearch === '' || 
+                                                        .filter((model) =>
+                                                            modelSearch === '' ||
                                                             model.id.toLowerCase().includes(modelSearch.toLowerCase()) ||
                                                             model.name.toLowerCase().includes(modelSearch.toLowerCase())
                                                         )
@@ -463,22 +467,21 @@ export function SettingsPanel() {
                                                                     setModelSearch('');
                                                                     setShowModelDropdown(false);
                                                                 }}
-                                                                className={`w-full px-3 py-2 text-left text-sm hover:bg-dark-700 transition-colors ${
-                                                                    localSettings.ai.model === model.id 
-                                                                        ? 'text-primary-400 bg-dark-700/50' 
+                                                                className={`w-full px-3 py-2 text-left text-sm hover:bg-dark-700 transition-colors ${localSettings.ai.model === model.id
+                                                                        ? 'text-primary-400 bg-dark-700/50'
                                                                         : 'text-white'
-                                                                }`}
+                                                                    }`}
                                                             >
                                                                 {model.name}
                                                             </button>
                                                         ))}
-                                                    {availableModels.filter((model) => 
-                                                        modelSearch === '' || 
+                                                    {availableModels.filter((model) =>
+                                                        modelSearch === '' ||
                                                         model.id.toLowerCase().includes(modelSearch.toLowerCase()) ||
                                                         model.name.toLowerCase().includes(modelSearch.toLowerCase())
                                                     ).length === 0 && (
-                                                        <div className="px-3 py-2 text-sm text-dark-400">No models found</div>
-                                                    )}
+                                                            <div className="px-3 py-2 text-sm text-dark-400">No models found</div>
+                                                        )}
                                                 </div>
                                             )}
                                         </div>
@@ -501,6 +504,60 @@ export function SettingsPanel() {
                                         value={localSettings.ai.fallback_to_local}
                                         onChange={(v) => update('ai', 'fallback_to_local', v)}
                                     />
+
+                                    {/* Favorite Models */}
+                                    <div className="border-t border-dark-700/50 pt-5">
+                                        <div className="flex items-center justify-between mb-3">
+                                            <div>
+                                                <label className="block text-sm font-medium text-white">Favorite Models</label>
+                                                <p className="text-xs text-dark-400 mt-0.5">Pick up to 5 models for quick access in Chat</p>
+                                            </div>
+                                            <span className="text-xs text-dark-500">{favorites.length}/5</span>
+                                        </div>
+
+                                        {/* Current favorites */}
+                                        {favorites.length > 0 && (
+                                            <div className="space-y-1.5 mb-3">
+                                                {favorites.map((fav) => (
+                                                    <div key={fav.id} className="flex items-center gap-2 px-3 py-2 bg-dark-800 rounded-lg">
+                                                        <Star className="w-3.5 h-3.5 text-amber-400 fill-amber-400 flex-shrink-0" />
+                                                        <span className="text-xs text-white flex-1 truncate">{fav.name}</span>
+                                                        <button
+                                                            onClick={() => removeFavorite(fav.id)}
+                                                            className="text-dark-500 hover:text-red-400 transition-colors flex-shrink-0"
+                                                            title="Remove from favorites"
+                                                        >
+                                                            <X className="w-3.5 h-3.5" />
+                                                        </button>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+
+                                        {/* Add from available models */}
+                                        {availableModels.length > 0 && favorites.length < 5 && (
+                                            <div className="max-h-40 overflow-y-auto border border-dark-700/50 rounded-lg">
+                                                {availableModels
+                                                    .filter((m) => !isFavorite(m.id))
+                                                    .slice(0, 20)
+                                                    .map((model) => (
+                                                        <button
+                                                            key={model.id}
+                                                            onClick={() => addFavorite({ id: model.id, name: model.name })}
+                                                            className="w-full flex items-center gap-2 px-3 py-2 text-left text-xs hover:bg-dark-800/60 transition-colors text-dark-300 hover:text-white"
+                                                        >
+                                                            <Star className="w-3 h-3 text-dark-600 flex-shrink-0" />
+                                                            <span className="truncate">{model.name}</span>
+                                                        </button>
+                                                    ))
+                                                }
+                                            </div>
+                                        )}
+
+                                        {availableModels.length === 0 && favorites.length < 5 && (
+                                            <p className="text-xs text-dark-500 italic">Enter an API key and refresh models to add favorites</p>
+                                        )}
+                                    </div>
                                 </div>
                             </CardContent>
                         </Card>

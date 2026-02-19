@@ -7,25 +7,120 @@ import {
     getChatMessages,
     sendChatMessage,
 } from '../../services/tauri';
-import { ChatSidebar } from './ChatSidebar';
 import { ChatMessage } from './ChatMessage';
-import { Send, Loader2, Bot, Sparkles } from 'lucide-react';
+import {
+    Send,
+    Loader2,
+    Bot,
+    Sparkles,
+    ChevronDown,
+    Grid3X3,
+    Calendar,
+    Check,
+    Plus,
+    Trash2,
+    MessageSquare,
+    PanelLeftClose,
+    PanelLeft,
+} from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
+import { useFavoriteModels } from '../../hooks/useFavoriteModels';
+import { useSettings } from '../../hooks/useSettings';
 
-export function ChatPage() {
+// Source options
+const SOURCE_OPTIONS = [
+    { id: 'apps', label: 'Applications', default: true },
+    { id: 'screen', label: 'Screen Text (OCR)', default: true },
+    { id: 'media', label: 'Media / Music', default: true },
+    { id: 'browser', label: 'Browser History', default: false },
+    { id: 'files', label: 'Files & Documents', default: false },
+];
+
+// Time range options
+const TIME_RANGE_OPTIONS = [
+    { id: 'today', label: 'Today' },
+    { id: 'yesterday', label: 'Yesterday' },
+    { id: 'last_3_days', label: 'Last 3 Days' },
+    { id: 'last_7_days', label: 'Last 7 Days' },
+    { id: 'last_30_days', label: 'Last 30 Days' },
+    { id: 'all_time', label: 'All Time' },
+];
+
+interface ChatPageProps {
+    initialPrompt?: string;
+}
+
+export function ChatPage({ initialPrompt }: ChatPageProps) {
     const [sessions, setSessions] = useState<ChatSession[]>([]);
     const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
     const [messages, setMessages] = useState<ChatMessageType[]>([]);
     const [input, setInput] = useState('');
     const [isSending, setIsSending] = useState(false);
     const [streamingContent, setStreamingContent] = useState('');
+    const [showHistory, setShowHistory] = useState(true);
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLTextAreaElement>(null);
+    const initialPromptHandled = useRef(false);
+
+    // Dropdown states
+    const [showModelDropdown, setShowModelDropdown] = useState(false);
+    const [showSourcesDropdown, setShowSourcesDropdown] = useState(false);
+    const [showTimeDropdown, setShowTimeDropdown] = useState(false);
+    const [selectedSources, setSelectedSources] = useState<string[]>(
+        SOURCE_OPTIONS.filter((s) => s.default).map((s) => s.id)
+    );
+    const [selectedTimeRange, setSelectedTimeRange] = useState('today');
+    const [selectedModel, setSelectedModel] = useState<string>('');
+
+    // Hooks
+    const { favorites } = useFavoriteModels();
+    const { settings } = useSettings();
+
+    // Refs for dropdowns
+    const modelRef = useRef<HTMLDivElement>(null);
+    const sourcesRef = useRef<HTMLDivElement>(null);
+    const timeRef = useRef<HTMLDivElement>(null);
+
+    // Set default model from settings
+    useEffect(() => {
+        if (settings?.ai.model && !selectedModel) {
+            setSelectedModel(settings.ai.model);
+        }
+    }, [settings]);
+
+    // Close dropdowns on outside click
+    useEffect(() => {
+        const handler = (e: MouseEvent) => {
+            if (modelRef.current && !modelRef.current.contains(e.target as Node)) {
+                setShowModelDropdown(false);
+            }
+            if (sourcesRef.current && !sourcesRef.current.contains(e.target as Node)) {
+                setShowSourcesDropdown(false);
+            }
+            if (timeRef.current && !timeRef.current.contains(e.target as Node)) {
+                setShowTimeDropdown(false);
+            }
+        };
+        document.addEventListener('mousedown', handler);
+        return () => document.removeEventListener('mousedown', handler);
+    }, []);
 
     // Load sessions on mount
     useEffect(() => {
         loadSessions();
     }, []);
+
+    // Handle initial prompt (from Homepage summary cards)
+    useEffect(() => {
+        if (initialPrompt && !initialPromptHandled.current && !isSending) {
+            initialPromptHandled.current = true;
+            setInput(initialPrompt);
+            // Auto-send after a short delay to let state settle
+            setTimeout(() => {
+                handleSendWithMessage(initialPrompt);
+            }, 300);
+        }
+    }, [initialPrompt]);
 
     // Load messages when active session changes
     useEffect(() => {
@@ -37,7 +132,7 @@ export function ChatPage() {
         setStreamingContent('');
     }, [activeSessionId]);
 
-    // Auto-scroll to bottom on new messages or streaming update
+    // Auto-scroll to bottom
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, [messages, streamingContent]);
@@ -45,18 +140,13 @@ export function ChatPage() {
     // Listen for streaming tokens
     useEffect(() => {
         let unlisten: (() => void) | undefined;
-
         async function setupListener() {
             unlisten = await listen<string>('chat://token', (event) => {
                 setStreamingContent((prev) => prev + event.payload);
             });
         }
-
         setupListener();
-
-        return () => {
-            if (unlisten) unlisten();
-        };
+        return () => { if (unlisten) unlisten(); };
     }, []);
 
     const loadSessions = async () => {
@@ -83,8 +173,6 @@ export function ChatPage() {
             setSessions((prev) => [session, ...prev]);
             setActiveSessionId(session.id);
             setMessages([]);
-
-            // Clean state
             setInput('');
             setStreamingContent('');
             inputRef.current?.focus();
@@ -93,7 +181,8 @@ export function ChatPage() {
         }
     };
 
-    const handleDeleteSession = async (id: string) => {
+    const handleDeleteSession = async (id: string, e: React.MouseEvent) => {
+        e.stopPropagation();
         try {
             await deleteChatSession(id);
             setSessions((prev) => prev.filter((s) => s.id !== id));
@@ -106,34 +195,44 @@ export function ChatPage() {
         }
     };
 
-    const handleSend = async () => {
-        if (!input.trim() || !activeSessionId || isSending) return;
+    const handleSendWithMessage = async (messageText: string) => {
+        if (!messageText.trim() || isSending) return;
 
-        const userMessage = input.trim();
+        let sessionId = activeSessionId;
+        if (!sessionId) {
+            try {
+                const session = await createChatSession();
+                setSessions((prev) => [session, ...prev]);
+                setActiveSessionId(session.id);
+                sessionId = session.id;
+            } catch (error) {
+                console.error('Failed to create session:', error);
+                return;
+            }
+        }
+
         setInput('');
         setIsSending(true);
         setStreamingContent('');
 
-        // Optimistically add user message
         const tempUserMsg: ChatMessageType = {
             id: Date.now(),
-            session_id: activeSessionId,
+            session_id: sessionId,
             role: 'user',
-            content: userMessage,
+            content: messageText.trim(),
             created_at: Math.floor(Date.now() / 1000),
         };
         setMessages((prev) => [...prev, tempUserMsg]);
 
         try {
-            const response = await sendChatMessage(activeSessionId, userMessage);
+            const response = await sendChatMessage(sessionId, messageText.trim());
             setMessages((prev) => [...prev, response]);
-            // Refresh sessions (title may have changed)
-            loadSessions();
+            loadSessions(); // Refresh sessions to update titles
         } catch (error) {
             console.error('Failed to send message:', error);
             const errorMsg: ChatMessageType = {
                 id: Date.now() + 1,
-                session_id: activeSessionId,
+                session_id: sessionId,
                 role: 'assistant',
                 content: `Sorry, something went wrong: ${error}`,
                 created_at: Math.floor(Date.now() / 1000),
@@ -145,6 +244,8 @@ export function ChatPage() {
         }
     };
 
+    const handleSend = () => handleSendWithMessage(input);
+
     const handleKeyDown = (e: React.KeyboardEvent) => {
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
@@ -152,11 +253,16 @@ export function ChatPage() {
         }
     };
 
-    // Helper to render streaming content safely
+    const toggleSource = (sourceId: string) => {
+        setSelectedSources((prev) =>
+            prev.includes(sourceId)
+                ? prev.filter((s) => s !== sourceId)
+                : [...prev, sourceId]
+        );
+    };
+
     const renderStreamingMessage = () => {
         if (!streamingContent) return null;
-
-        // If it starts with JSON brace, show "Thinking..."
         if (streamingContent.trim().startsWith('{')) {
             return (
                 <div className="flex justify-start mb-4 animate-pulse">
@@ -165,14 +271,10 @@ export function ChatPage() {
                             <Bot className="w-4 h-4" />
                             <span className="text-sm font-medium">Thinking...</span>
                         </div>
-                        {/* Optional: Show raw output for debug */}
-                        {/* <pre className="text-[10px] text-dark-500 mt-2 overflow-hidden">{streamingContent.slice(-100)}</pre> */}
                     </div>
                 </div>
             );
         }
-
-        // Otherwise show text
         const tempMsg: ChatMessageType = {
             id: -1,
             session_id: activeSessionId || '',
@@ -180,131 +282,342 @@ export function ChatPage() {
             content: streamingContent,
             created_at: Date.now() / 1000,
         };
-
         return <ChatMessage message={tempMsg} />;
     };
 
-    return (
-        <div className="flex h-[calc(100vh-64px)] bg-dark-950">
-            {/* Sidebar */}
-            <ChatSidebar
-                sessions={sessions}
-                activeSessionId={activeSessionId}
-                onSelectSession={setActiveSessionId}
-                onNewSession={handleNewSession}
-                onDeleteSession={handleDeleteSession}
-            />
+    const getModelDisplayName = () => {
+        if (!selectedModel) return 'Select Model';
+        const fav = favorites.find((f) => f.id === selectedModel);
+        if (fav) return fav.name;
+        const parts = selectedModel.split('/');
+        return parts[parts.length - 1] || selectedModel;
+    };
 
-            {/* Chat Area */}
-            <div className="flex-1 flex flex-col min-w-0">
-                {activeSessionId ? (
-                    <>
-                        {/* Messages */}
-                        <div className="flex-1 overflow-y-auto px-6 py-4">
-                            {messages.length === 0 ? (
-                                <div className="flex flex-col items-center justify-center h-full text-center">
-                                    <div className="w-16 h-16 bg-primary-600/10 rounded-2xl flex items-center justify-center mb-4">
-                                        <Sparkles className="w-8 h-8 text-primary-400" />
-                                    </div>
-                                    <h3 className="text-lg font-semibold text-white mb-1">Start a conversation</h3>
-                                    <p className="text-sm text-dark-400 max-w-md">
-                                        Ask about your activity history, screen content, music playback, or anything IntentFlow tracks.
-                                    </p>
-                                    <div className="mt-6 flex flex-wrap gap-2 justify-center">
-                                        {[
-                                            'What did I do today?',
-                                            'What songs did I listen to?',
-                                            'How much time on VS Code?',
-                                            'What was on my screen earlier?',
-                                        ].map((suggestion) => (
-                                            <button
-                                                key={suggestion}
-                                                onClick={() => {
-                                                    setInput(suggestion);
-                                                    inputRef.current?.focus();
-                                                }}
-                                                className="px-3 py-1.5 text-xs bg-dark-800 border border-dark-700 text-dark-300 rounded-full hover:bg-dark-700 hover:text-white transition-colors"
-                                            >
-                                                {suggestion}
-                                            </button>
-                                        ))}
-                                    </div>
+    const getTimeRangeLabel = () =>
+        TIME_RANGE_OPTIONS.find((t) => t.id === selectedTimeRange)?.label || 'Today';
+
+    const getSourcesSummary = () => {
+        if (selectedSources.length === SOURCE_OPTIONS.length) return 'All Sources';
+        if (selectedSources.length === 0) return 'No Sources';
+        return `${selectedSources.length} Sources`;
+    };
+
+    const formatSessionDate = (timestamp: number) => {
+        const d = new Date(timestamp * 1000);
+        const now = new Date();
+        const diffMs = now.getTime() - d.getTime();
+        const diffMins = Math.floor(diffMs / 60000);
+        if (diffMins < 1) return 'Just now';
+        if (diffMins < 60) return `${diffMins}m ago`;
+        const diffHours = Math.floor(diffMins / 60);
+        if (diffHours < 24) return `${diffHours}h ago`;
+        const diffDays = Math.floor(diffHours / 24);
+        if (diffDays < 7) return `${diffDays}d ago`;
+        return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    };
+
+    const hasMessages = messages.length > 0;
+
+    // Control bar (shared between empty and message states)
+    const controlBar = (
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+            <div className="flex items-center gap-2 flex-wrap">
+                {/* Model selector */}
+                <div className="relative" ref={modelRef}>
+                    <button
+                        onClick={() => {
+                            setShowModelDropdown(!showModelDropdown);
+                            setShowSourcesDropdown(false);
+                            setShowTimeDropdown(false);
+                        }}
+                        className="flex items-center gap-1.5 px-3 py-2 rounded-full bg-dark-800 border border-dark-700/50 text-sm text-dark-200 hover:text-white hover:border-dark-600 transition-colors"
+                    >
+                        <Sparkles className="w-3.5 h-3.5 text-blue-400" />
+                        <span className="text-xs font-medium max-w-[120px] truncate">{getModelDisplayName()}</span>
+                        <ChevronDown className={`w-3 h-3 text-dark-500 transition-transform ${showModelDropdown ? 'rotate-180' : ''}`} />
+                    </button>
+                    {showModelDropdown && (
+                        <div className="absolute bottom-full mb-2 left-0 w-64 bg-dark-800 border border-dark-700 rounded-xl shadow-2xl shadow-black/40 z-50 py-1 max-h-64 overflow-y-auto">
+                            <div className="px-3 py-2 border-b border-dark-700/50">
+                                <p className="text-[10px] font-semibold text-dark-400 uppercase tracking-wider">Favorite Models</p>
+                            </div>
+                            {favorites.length === 0 ? (
+                                <div className="px-3 py-4 text-center">
+                                    <p className="text-xs text-dark-500">No favorite models</p>
+                                    <p className="text-[10px] text-dark-600 mt-1">Add favorites in Settings → AI</p>
                                 </div>
                             ) : (
+                                favorites.map((model) => (
+                                    <button
+                                        key={model.id}
+                                        onClick={() => { setSelectedModel(model.id); setShowModelDropdown(false); }}
+                                        className={`w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-dark-700/50 transition-colors ${selectedModel === model.id ? 'text-blue-400' : 'text-dark-200'
+                                            }`}
+                                    >
+                                        <Sparkles className="w-3.5 h-3.5 flex-shrink-0" />
+                                        <span className="flex-1 truncate text-xs">{model.name}</span>
+                                        {selectedModel === model.id && <Check className="w-3.5 h-3.5 text-blue-400 flex-shrink-0" />}
+                                    </button>
+                                ))
+                            )}
+                            {settings?.ai.model && !favorites.some((f) => f.id === settings.ai.model) && (
                                 <>
-                                    {messages.map((msg) => (
-                                        <ChatMessage key={msg.id} message={msg} />
-                                    ))}
-
-                                    {/* Streaming Message or Loading State */}
-                                    {streamingContent ? renderStreamingMessage() : isSending && (
-                                        <div className="flex items-center gap-2 text-dark-400 mb-4 px-4">
-                                            <div className="bg-dark-800 rounded-2xl rounded-bl-md px-4 py-3 border border-dark-700">
-                                                <div className="flex items-center gap-2">
-                                                    <Loader2 className="w-4 h-4 animate-spin" />
-                                                    <span className="text-sm">Connecting...</span>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    )}
-                                    <div ref={messagesEndRef} />
+                                    <div className="px-3 py-2 border-t border-dark-700/50">
+                                        <p className="text-[10px] font-semibold text-dark-400 uppercase tracking-wider">Current (Settings)</p>
+                                    </div>
+                                    <button
+                                        onClick={() => { setSelectedModel(settings.ai.model); setShowModelDropdown(false); }}
+                                        className={`w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-dark-700/50 transition-colors ${selectedModel === settings.ai.model ? 'text-blue-400' : 'text-dark-200'
+                                            }`}
+                                    >
+                                        <Sparkles className="w-3.5 h-3.5 flex-shrink-0" />
+                                        <span className="flex-1 truncate text-xs">{settings.ai.model}</span>
+                                        {selectedModel === settings.ai.model && <Check className="w-3.5 h-3.5 text-blue-400 flex-shrink-0" />}
+                                    </button>
                                 </>
                             )}
                         </div>
+                    )}
+                </div>
 
-                        {/* Input */}
-                        <div className="border-t border-dark-800 bg-dark-900/50 backdrop-blur-sm px-6 py-4">
-                            <div className="flex items-end gap-3 max-w-3xl mx-auto">
-                                <div className="flex-1 relative">
-                                    <textarea
-                                        ref={inputRef}
-                                        value={input}
-                                        onChange={(e) => setInput(e.target.value)}
-                                        onKeyDown={handleKeyDown}
-                                        placeholder="Ask about your activity..."
-                                        rows={1}
-                                        className="w-full resize-none bg-dark-800 border border-dark-700 text-white rounded-xl px-4 py-3 text-sm placeholder-dark-500 focus:outline-none focus:ring-2 focus:ring-primary-600/50 focus:border-primary-600 transition-all"
-                                        style={{
-                                            minHeight: '44px',
-                                            maxHeight: '120px',
-                                        }}
-                                        onInput={(e) => {
-                                            const target = e.target as HTMLTextAreaElement;
-                                            target.style.height = 'auto';
-                                            target.style.height = `${Math.min(target.scrollHeight, 120)}px`;
-                                        }}
-                                    />
-                                </div>
+                {/* Sources */}
+                <div className="relative" ref={sourcesRef}>
+                    <button
+                        onClick={() => {
+                            setShowSourcesDropdown(!showSourcesDropdown);
+                            setShowModelDropdown(false);
+                            setShowTimeDropdown(false);
+                        }}
+                        className="flex items-center gap-1.5 px-3 py-2 rounded-full bg-dark-800 border border-dark-700/50 text-sm text-dark-200 hover:text-white hover:border-dark-600 transition-colors"
+                    >
+                        <Grid3X3 className="w-3.5 h-3.5" />
+                        <span className="text-xs font-medium">{getSourcesSummary()}</span>
+                        <ChevronDown className={`w-3 h-3 text-dark-500 transition-transform ${showSourcesDropdown ? 'rotate-180' : ''}`} />
+                    </button>
+                    {showSourcesDropdown && (
+                        <div className="absolute bottom-full mb-2 left-0 w-56 bg-dark-800 border border-dark-700 rounded-xl shadow-2xl shadow-black/40 z-50 py-1">
+                            <div className="px-3 py-2 border-b border-dark-700/50">
+                                <p className="text-[10px] font-semibold text-dark-400 uppercase tracking-wider">Data Sources</p>
+                            </div>
+                            {SOURCE_OPTIONS.map((source) => (
                                 <button
-                                    onClick={handleSend}
-                                    disabled={!input.trim() || isSending}
-                                    className="flex-shrink-0 p-3 bg-primary-600 hover:bg-primary-500 disabled:bg-dark-700 disabled:text-dark-500 text-white rounded-xl transition-colors"
+                                    key={source.id}
+                                    onClick={() => toggleSource(source.id)}
+                                    className="w-full flex items-center gap-2.5 px-3 py-2 text-left text-sm hover:bg-dark-700/50 transition-colors"
                                 >
-                                    {isSending ? (
-                                        <Loader2 className="w-5 h-5 animate-spin" />
-                                    ) : (
-                                        <Send className="w-5 h-5" />
-                                    )}
+                                    <div className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 transition-colors ${selectedSources.includes(source.id) ? 'bg-blue-500 border-blue-500' : 'border-dark-600 bg-transparent'
+                                        }`}>
+                                        {selectedSources.includes(source.id) && <Check className="w-3 h-3 text-white" />}
+                                    </div>
+                                    <span className={`text-xs ${selectedSources.includes(source.id) ? 'text-white' : 'text-dark-300'}`}>
+                                        {source.label}
+                                    </span>
                                 </button>
+                            ))}
+                        </div>
+                    )}
+                </div>
+
+                {/* Time Range */}
+                <div className="relative" ref={timeRef}>
+                    <button
+                        onClick={() => {
+                            setShowTimeDropdown(!showTimeDropdown);
+                            setShowModelDropdown(false);
+                            setShowSourcesDropdown(false);
+                        }}
+                        className="flex items-center gap-1.5 px-3 py-2 rounded-full bg-dark-800 border border-dark-700/50 text-sm text-dark-200 hover:text-white hover:border-dark-600 transition-colors"
+                    >
+                        <Calendar className="w-3.5 h-3.5" />
+                        <span className="text-xs font-medium">{getTimeRangeLabel()}</span>
+                        <ChevronDown className={`w-3 h-3 text-dark-500 transition-transform ${showTimeDropdown ? 'rotate-180' : ''}`} />
+                    </button>
+                    {showTimeDropdown && (
+                        <div className="absolute bottom-full mb-2 left-0 w-48 bg-dark-800 border border-dark-700 rounded-xl shadow-2xl shadow-black/40 z-50 py-1">
+                            <div className="px-3 py-2 border-b border-dark-700/50">
+                                <p className="text-[10px] font-semibold text-dark-400 uppercase tracking-wider">Time Range</p>
+                            </div>
+                            {TIME_RANGE_OPTIONS.map((range) => (
+                                <button
+                                    key={range.id}
+                                    onClick={() => { setSelectedTimeRange(range.id); setShowTimeDropdown(false); }}
+                                    className={`w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-dark-700/50 transition-colors ${selectedTimeRange === range.id ? 'text-blue-400' : 'text-dark-200'
+                                        }`}
+                                >
+                                    <span className="flex-1 text-xs">{range.label}</span>
+                                    {selectedTimeRange === range.id && <Check className="w-3.5 h-3.5 text-blue-400" />}
+                                </button>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            </div>
+
+            {/* Send */}
+            <button
+                onClick={handleSend}
+                disabled={!input.trim() || isSending}
+                className="flex items-center gap-1.5 px-4 py-2 rounded-full bg-dark-800 border border-dark-700/50 text-dark-200 hover:text-white hover:border-dark-600 disabled:opacity-30 disabled:hover:text-dark-200 transition-colors"
+                id="chat-send"
+            >
+                {isSending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                <span className="text-xs font-medium">Send</span>
+            </button>
+        </div>
+    );
+
+    return (
+        <div className="flex h-full bg-dark-950">
+            {/* Chat History Panel */}
+            {showHistory && (
+                <div className="w-56 flex-shrink-0 bg-dark-900/60 border-r border-dark-800/50 flex flex-col">
+                    {/* History Header */}
+                    <div className="flex items-center justify-between px-3 py-3 border-b border-dark-800/50">
+                        <span className="text-xs font-semibold text-dark-400 uppercase tracking-wider">History</span>
+                        <div className="flex items-center gap-1">
+                            <button
+                                onClick={handleNewSession}
+                                className="w-7 h-7 flex items-center justify-center rounded-md text-dark-400 hover:text-white hover:bg-dark-800 transition-colors"
+                                title="New chat"
+                            >
+                                <Plus className="w-4 h-4" />
+                            </button>
+                            <button
+                                onClick={() => setShowHistory(false)}
+                                className="w-7 h-7 flex items-center justify-center rounded-md text-dark-400 hover:text-white hover:bg-dark-800 transition-colors"
+                                title="Close history"
+                            >
+                                <PanelLeftClose className="w-4 h-4" />
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* Session List */}
+                    <div className="flex-1 overflow-y-auto py-1">
+                        {sessions.length === 0 ? (
+                            <div className="px-3 py-8 text-center">
+                                <MessageSquare className="w-8 h-8 text-dark-700 mx-auto mb-2" />
+                                <p className="text-xs text-dark-500">No conversations yet</p>
+                                <button
+                                    onClick={handleNewSession}
+                                    className="mt-3 text-xs text-primary-400 hover:text-primary-300 transition-colors"
+                                >
+                                    Start your first chat
+                                </button>
+                            </div>
+                        ) : (
+                            sessions.map((session) => (
+                                <button
+                                    key={session.id}
+                                    onClick={() => setActiveSessionId(session.id)}
+                                    className={`group w-full flex items-start gap-2 px-3 py-2.5 text-left transition-colors ${activeSessionId === session.id
+                                            ? 'bg-dark-800/80 text-white'
+                                            : 'text-dark-300 hover:bg-dark-800/40 hover:text-dark-200'
+                                        }`}
+                                >
+                                    <MessageSquare className="w-3.5 h-3.5 mt-0.5 flex-shrink-0 text-dark-500" />
+                                    <div className="flex-1 min-w-0">
+                                        <p className="text-xs font-medium truncate">
+                                            {session.title || 'New Chat'}
+                                        </p>
+                                        <p className="text-[10px] text-dark-500 mt-0.5">
+                                            {formatSessionDate(session.updated_at)}
+                                        </p>
+                                    </div>
+                                    <button
+                                        onClick={(e) => handleDeleteSession(session.id, e)}
+                                        className="opacity-0 group-hover:opacity-100 flex-shrink-0 w-6 h-6 flex items-center justify-center rounded text-dark-500 hover:text-red-400 hover:bg-dark-700/50 transition-all"
+                                        title="Delete"
+                                    >
+                                        <Trash2 className="w-3 h-3" />
+                                    </button>
+                                </button>
+                            ))
+                        )}
+                    </div>
+                </div>
+            )}
+
+            {/* Main Chat Area */}
+            <div className="flex-1 flex flex-col min-w-0">
+                {/* Top: History toggle if hidden */}
+                {!showHistory && (
+                    <div className="px-4 py-2 flex-shrink-0">
+                        <button
+                            onClick={() => setShowHistory(true)}
+                            className="w-8 h-8 flex items-center justify-center rounded-lg text-dark-400 hover:text-white hover:bg-dark-800 transition-colors"
+                            title="Show chat history"
+                        >
+                            <PanelLeft className="w-[18px] h-[18px]" />
+                        </button>
+                    </div>
+                )}
+
+                {hasMessages ? (
+                    <>
+                        {/* Messages */}
+                        <div className="flex-1 overflow-y-auto px-6 py-4">
+                            <div className="max-w-3xl mx-auto">
+                                {messages.map((msg) => (
+                                    <ChatMessage key={msg.id} message={msg} />
+                                ))}
+                                {streamingContent ? renderStreamingMessage() : isSending && (
+                                    <div className="flex items-center gap-2 text-dark-400 mb-4">
+                                        <div className="bg-dark-800 rounded-2xl rounded-bl-md px-4 py-3 border border-dark-700">
+                                            <div className="flex items-center gap-2">
+                                                <Loader2 className="w-4 h-4 animate-spin" />
+                                                <span className="text-sm">Thinking...</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                                <div ref={messagesEndRef} />
+                            </div>
+                        </div>
+
+                        {/* Input (with messages) */}
+                        <div className="border-t border-dark-800/50 bg-dark-950 px-6 py-4">
+                            <div className="max-w-3xl mx-auto space-y-3">
+                                <textarea
+                                    ref={inputRef}
+                                    value={input}
+                                    onChange={(e) => setInput(e.target.value)}
+                                    onKeyDown={handleKeyDown}
+                                    placeholder="Ask about your activity..."
+                                    rows={1}
+                                    className="w-full resize-none bg-dark-800/60 border border-dark-700/50 text-white rounded-xl px-4 py-3 text-sm placeholder-dark-500 focus:outline-none focus:ring-1 focus:ring-dark-600 focus:border-dark-600"
+                                    style={{ minHeight: '44px', maxHeight: '120px' }}
+                                    onInput={(e) => {
+                                        const t = e.target as HTMLTextAreaElement;
+                                        t.style.height = 'auto';
+                                        t.style.height = `${Math.min(t.scrollHeight, 120)}px`;
+                                    }}
+                                />
+                                {controlBar}
                             </div>
                         </div>
                     </>
                 ) : (
-                    /* No session selected */
-                    <div className="flex-1 flex flex-col items-center justify-center">
-                        <div className="w-20 h-20 bg-dark-800 rounded-2xl flex items-center justify-center mb-4">
-                            <Bot className="w-10 h-10 text-dark-500" />
+                    /* Empty state */
+                    <div className="flex-1 flex flex-col items-center justify-center px-6">
+                        <div className="w-full max-w-2xl space-y-4">
+                            <textarea
+                                ref={inputRef}
+                                value={input}
+                                onChange={(e) => setInput(e.target.value)}
+                                onKeyDown={handleKeyDown}
+                                placeholder="Ask about moments or topics from your memories..."
+                                rows={1}
+                                className="w-full resize-none bg-dark-800/40 border border-dark-700/40 text-white rounded-2xl px-5 py-4 text-sm placeholder-dark-500 focus:outline-none focus:ring-1 focus:ring-dark-600 focus:border-dark-600"
+                                style={{ minHeight: '52px', maxHeight: '120px' }}
+                                onInput={(e) => {
+                                    const t = e.target as HTMLTextAreaElement;
+                                    t.style.height = 'auto';
+                                    t.style.height = `${Math.min(t.scrollHeight, 120)}px`;
+                                }}
+                            />
+                            {controlBar}
                         </div>
-                        <h2 className="text-xl font-semibold text-white mb-2">IntentFlow Chat</h2>
-                        <p className="text-sm text-dark-400 mb-6 max-w-sm text-center">
-                            Chat with an AI agent that queries your activity history, screen text, and media playback in real time.
-                        </p>
-                        <button
-                            onClick={handleNewSession}
-                            className="px-6 py-2.5 bg-primary-600 hover:bg-primary-500 text-white rounded-lg text-sm font-medium transition-colors"
-                        >
-                            Start a new chat
-                        </button>
                     </div>
                 )}
             </div>
