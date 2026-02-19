@@ -9,6 +9,7 @@ pub struct ActivityMetadata {
     pub screen_text: Option<String>,
     pub background_windows: Option<Vec<String>>,
     pub media_info: Option<MediaInfo>,
+    pub raw_duration_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -108,6 +109,7 @@ impl ActivityEvent {
                 screen_text: None,
                 background_windows: None,
                 media_info: None,
+                raw_duration_ms: None,
             },
         }
     }

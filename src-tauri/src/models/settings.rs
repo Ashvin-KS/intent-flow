@@ -60,7 +60,7 @@ impl Default for TrackingSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            tracking_interval: 5,
+            tracking_interval: 10,
             idle_timeout: 300,
             exclude_apps: vec![],
             exclude_urls: vec![],

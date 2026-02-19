@@ -81,6 +81,9 @@ pub async fn update_settings(
     let content = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     
     std::fs::write(&config_path, content).map_err(|e| e.to_string())?;
+
+    crate::services::activity_tracker::set_tracking_enabled(settings.tracking.enabled);
+    crate::services::activity_tracker::set_tracking_interval(settings.tracking.tracking_interval);
     
     Ok(())
 }

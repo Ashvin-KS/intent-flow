@@ -1,99 +1,86 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
-use crate::models::ActivityEvent;
+use crate::models::{ActivityEvent, ActivityMetadata};
 
 static TRACKING_ENABLED: AtomicBool = AtomicBool::new(true);
+static TRACKING_INTERVAL_SECS: AtomicU64 = AtomicU64::new(DEFAULT_TRACKING_INTERVAL_SECS);
+
+const DEFAULT_TRACKING_INTERVAL_SECS: u64 = 10;
+const MIN_TRACKING_INTERVAL_SECS: u64 = 1;
+const MAX_TRACKING_INTERVAL_SECS: u64 = 60;
+const FOCUS_POLL_INTERVAL_MS: u64 = 200;
+const MIN_RECORDED_DURATION_MS: i64 = 1;
+
+#[derive(Clone)]
+struct ActivitySession {
+    window: ActiveWindow,
+    start_ms: i64,
+    last_seen_ms: i64,
+    metadata: ActivityMetadata,
+    metadata_last_updated_ms: i64,
+}
 
 pub fn start_tracking(app_handle: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let mut last_activity: Option<ActivityEvent> = None;
-        
+        initialize_tracking_from_settings(&app_handle);
+        let mut session: Option<ActivitySession> = None;
+
         loop {
+            let interval_secs = tracking_interval_secs();
+            let metadata_refresh_ms = (interval_secs * 1000) as i64;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+
             if !TRACKING_ENABLED.load(Ordering::Relaxed) {
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                if let Some(active) = session.take() {
+                    if let Err(e) = finalize_and_store_activity(&app_handle, active, now_ms) {
+                        log::error!("Failed to store activity while disabling tracking: {}", e);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(FOCUS_POLL_INTERVAL_MS)).await;
                 continue;
             }
 
-            // Get active window
             match get_active_window() {
                 Ok(Some(window)) => {
-                    let now = chrono::Utc::now().timestamp();
-                    
-                    // Create activity event
-                    let activity = ActivityEvent::new(
-                        window.app_name,
-                        window.title,
-                        window.category_id,
-                        now,
-                        now + 5, // 5 second interval
-                    );
-                    
-                    let mut activity = activity;
-                    
-                    // Attach latest OCR screen text to activity metadata
-                    let screen_text = super::screen_capture::get_latest_screen_text();
-                    activity.metadata.screen_text = screen_text;
+                    if let Some(ref mut active) = session {
+                        let is_same_window = active.window.app_name == window.app_name
+                            && active.window.title == window.title;
 
-                    // Attach currently open background windows (for music tracking etc)
-                    let bg_windows = crate::utils::windows::get_open_windows();
-                    if !bg_windows.is_empty() {
-                         activity.metadata.background_windows = Some(bg_windows);
-                    }
-
-                    // Attach current media info (SMTC - Spotify, YouTube, etc.)
-                    // Run synchrounous Windows API call in blocking thread
-                    let media_info = match tokio::task::spawn_blocking(|| {
-                        crate::utils::windows::get_media_info()
-                    }).await {
-                        Ok(info) => info,
-                        Err(e) => {
-                            println!("[Tracker] ⚠️ SMTC spawn_blocking failed: {:?}", e);
-                            None
-                        }
-                    };
-                    
-                    activity.metadata.media_info = media_info;
-
-                    // Check if we should merge with last activity
-                    if let Some(ref last) = last_activity {
-                        // Merge only if app + window title are the same.
-                        // Background music and open windows are CONTEXT, not the activity itself.
-                        // A song changing or a window opening shouldn't split the activity.
-                        let is_same_app = last.app_name == activity.app_name && last.window_title == activity.window_title;
-
-                        if is_same_app {
-                            // Merge: extend duration, keep LATEST metadata
-                            // (latest screen text, latest media info, latest bg windows)
-                            let mut merged = ActivityEvent {
-                                end_time: activity.end_time,
-                                duration_seconds: last.duration_seconds + 5,
-                                ..last.clone()
-                            };
-                            // Always keep the freshest metadata snapshot
-                            merged.metadata = activity.metadata;
-                            // But preserve screen_text from last if current is empty
-                            if merged.metadata.screen_text.is_none() {
-                                merged.metadata.screen_text = last.metadata.screen_text.clone();
+                        if is_same_window {
+                            active.last_seen_ms = now_ms;
+                            if now_ms - active.metadata_last_updated_ms >= metadata_refresh_ms {
+                                let refreshed = capture_metadata().await;
+                                merge_session_metadata(&mut active.metadata, refreshed);
+                                active.metadata_last_updated_ms = now_ms;
                             }
-                            
-                            last_activity = Some(merged);
                         } else {
-                            // Store the previous activity
-                            if let Err(e) = store_activity(&app_handle, last) {
-                                log::error!("Failed to store activity: {}", e);
+                            let finished = active.clone();
+                            if let Err(e) = finalize_and_store_activity(&app_handle, finished, now_ms) {
+                                log::error!("Failed to store activity on focus change: {}", e);
                             }
-                            last_activity = Some(activity);
+                            session = Some(ActivitySession {
+                                window,
+                                start_ms: now_ms,
+                                last_seen_ms: now_ms,
+                                metadata: capture_metadata().await,
+                                metadata_last_updated_ms: now_ms,
+                            });
                         }
                     } else {
-                        last_activity = Some(activity);
+                        session = Some(ActivitySession {
+                            window,
+                            start_ms: now_ms,
+                            last_seen_ms: now_ms,
+                            metadata: capture_metadata().await,
+                            metadata_last_updated_ms: now_ms,
+                        });
                     }
                 }
                 Ok(None) => {
-                    // No active window (idle or locked)
-                    if let Some(last) = last_activity.take() {
-                        if let Err(e) = store_activity(&app_handle, &last) {
+                    if let Some(active) = session.take() {
+                        if let Err(e) = finalize_and_store_activity(&app_handle, active, now_ms) {
                             log::error!("Failed to store activity: {}", e);
                         }
                     }
@@ -103,11 +90,97 @@ pub fn start_tracking(app_handle: AppHandle) {
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_millis(FOCUS_POLL_INTERVAL_MS)).await;
         }
     });
 }
+fn initialize_tracking_from_settings(app_handle: &AppHandle) {
+    let data_dir = match app_handle.path().app_data_dir() {
+        Ok(dir) => dir,
+        Err(_) => return,
+    };
+    let config_path = data_dir.join("config").join("settings.json");
+    if !config_path.exists() {
+        return;
+    }
 
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(_) => return,
+    };
+
+    if let Ok(settings) = serde_json::from_str::<crate::models::Settings>(&content) {
+        set_tracking_enabled(settings.tracking.enabled);
+        set_tracking_interval(settings.tracking.tracking_interval);
+    }
+}
+
+fn clamp_tracking_interval(seconds: u64) -> u64 {
+    seconds.clamp(MIN_TRACKING_INTERVAL_SECS, MAX_TRACKING_INTERVAL_SECS)
+}
+
+fn tracking_interval_secs() -> u64 {
+    clamp_tracking_interval(TRACKING_INTERVAL_SECS.load(Ordering::Relaxed))
+}
+
+async fn capture_metadata() -> ActivityMetadata {
+    let mut metadata = ActivityMetadata::default();
+    metadata.screen_text = super::screen_capture::get_latest_screen_text();
+
+    let bg_windows = crate::utils::windows::get_open_windows();
+    if !bg_windows.is_empty() {
+        metadata.background_windows = Some(bg_windows);
+    }
+
+    metadata.media_info = match tokio::task::spawn_blocking(|| crate::utils::windows::get_media_info()).await {
+        Ok(info) => info,
+        Err(e) => {
+            println!("[Tracker] SMTC spawn_blocking failed: {:?}", e);
+            None
+        }
+    };
+
+    metadata
+}
+
+fn merge_session_metadata(current: &mut ActivityMetadata, incoming: ActivityMetadata) {
+    if incoming.screen_text.is_some() {
+        current.screen_text = incoming.screen_text;
+    }
+    if incoming.background_windows.is_some() {
+        current.background_windows = incoming.background_windows;
+    }
+    if incoming.media_info.is_some() {
+        current.media_info = incoming.media_info;
+    }
+}
+
+fn finalize_and_store_activity(
+    app_handle: &AppHandle,
+    session: ActivitySession,
+    end_ms: i64,
+) -> Result<(), String> {
+    let duration_ms = (end_ms - session.start_ms).max(MIN_RECORDED_DURATION_MS);
+    let duration_seconds = ((duration_ms + 999) / 1000) as i32;
+
+    let start_time = session.start_ms / 1000;
+    let end_time = start_time + duration_seconds as i64;
+
+    let mut activity = ActivityEvent::new(
+        session.window.app_name,
+        session.window.title,
+        session.window.category_id,
+        start_time,
+        end_time,
+    );
+    activity.duration_seconds = duration_seconds;
+    activity.metadata = session.metadata;
+    activity.metadata.raw_duration_ms = Some(duration_ms);
+
+    store_activity(app_handle, &activity)
+}
+
+#[derive(Clone)]
 struct ActiveWindow {
     app_name: String,
     title: String,
@@ -315,3 +388,8 @@ pub fn set_tracking_enabled(enabled: bool) {
 pub fn is_tracking_enabled() -> bool {
     TRACKING_ENABLED.load(Ordering::Relaxed)
 }
+
+pub fn set_tracking_interval(seconds: u64) {
+    TRACKING_INTERVAL_SECS.store(clamp_tracking_interval(seconds), Ordering::Relaxed);
+}
+
