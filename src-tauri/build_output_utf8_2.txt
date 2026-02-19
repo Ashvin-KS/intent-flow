@@ -1,0 +1,129 @@
+﻿cargo :     Checking 
+tauri-runtime-wry 
+v2.10.0
+At line:1 char:1
++ cargo check > 
+build_output_2.txt 
+2>&1
++ ~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~
+    + CategoryInfo   
+           : NotSpe  
+  cified: (    Che   
+ cking tauri-runt    
+ime-wry v2.10.0:    
+String) [], Remo    
+teException
+    + FullyQualified 
+   ErrorId : Native  
+  CommandError
+ 
+   Compiling 
+intentflow v1.0.0 
+(C:\Users\Saarathi N\
+Downloads\intent-flow
+-main\src-tauri)
+    Checking tauri 
+v2.10.2
+    Checking tauri-pl
+ugin-notification 
+v2.3.3
+    Checking tauri-pl
+ugin-autostart v2.5.1
+error: proc macro 
+panicked
+  --> 
+src\main.rs:87:14
+   |
+87 |         .run(tau
+ri::generate_context!
+())
+   |              ^^^
+^^^^^^^^^^^^^^^^^^^^^
+^^
+   |
+   = help: message: 
+The `frontendDist` 
+configuration is set 
+to `"../dist"` but 
+this path doesn't 
+exist
+
+warning: unused 
+import: `Manager`
+ --> src\services\cli
+pboard_tracker.rs:1:2
+4
+  |
+1 | use 
+tauri::{AppHandle, 
+Manager};
+  |                  
+      ^^^^^^^
+  |
+  = note: `#[warn(unu
+sed_imports)]` (part 
+of 
+`#[warn(unused)]`) 
+on by default
+
+warning: unused 
+import: `crate::model
+s::activity::Activity
+Event`
+ --> src\services\cli
+pboard_tracker.rs:5:5
+  |
+5 | use crate::models
+::activity::ActivityE
+vent; // For app 
+name if needed, or 
+just generic
+  |     ^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^
+^^^^
+
+error[E0308]: 
+mismatched types
+  --> src\services\cl
+ipboard_tracker.rs:51
+:12
+   |
+51 |     
+s.hash(&hasher);
+   |       ---- 
+^^^^^^^ types differ 
+in mutability
+   |       |
+   |       arguments 
+to this method are 
+incorrect
+   |
+   = note: expected 
+mutable reference 
+`&mut _`
+                     
+ found reference 
+`&DefaultHasher`
+note: method defined 
+here
+  --> /rustc/01f6ddf7
+588f42ae2d7eb0a2f21d4
+4e8e96674cf\library\c
+ore\src\hash\mod.rs:1
+99:8
+
+For more information 
+about this error, 
+try `rustc --explain 
+E0308`.
+warning: 
+`intentflow` (bin 
+"intentflow") 
+generated 2 warnings
+error: could not 
+compile `intentflow` 
+(bin "intentflow") 
+due to 2 previous 
+errors; 2 warnings 
+emitted

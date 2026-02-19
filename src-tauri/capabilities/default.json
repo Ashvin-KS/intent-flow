@@ -1,0 +1,12 @@
+{
+    "$schema": "../gen/schemas/capabilities.json",
+    "identifier": "default",
+    "description": "Default capabilities for IntentFlow",
+    "windows": [
+        "main"
+    ],
+    "permissions": [
+        "core:default",
+        "notification:default"
+    ]
+}

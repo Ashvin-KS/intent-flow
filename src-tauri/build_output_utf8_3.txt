@@ -1,0 +1,169 @@
+﻿cargo :     Checking 
+intentflow v1.0.0 
+(C:\Users\Saarathi N\
+Downloads\intent-flow
+-main\src-tauri)
+At line:1 char:1
++ cargo check > 
+build_output_3.txt 
+2>&1
++ ~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~
+    + CategoryInfo   
+           : NotSpe  
+  cified: (    Che   
+ cking in...main\    
+src-tauri):Strin    
+g) [], RemoteExc    
+eption
+    + FullyQualified 
+   ErrorId : Native  
+  CommandError
+ 
+warning: field 
+`reasoning` is never 
+read
+  --> src\commands\in
+tent.rs:45:5
+   |
+41 | struct 
+AiIntentResponse {
+   |        
+---------------- 
+field in this struct
+...
+45 |     reasoning: 
+Option<String>,
+   |     ^^^^^^^^^
+   |
+   = note: 
+`#[warn(dead_code)]` 
+(part of 
+`#[warn(unused)]`) 
+on by default
+
+warning: struct 
+`CreateEntryRequest` 
+is never constructed
+  --> src\models\entr
+y.rs:17:12
+   |
+17 | pub struct 
+CreateEntryRequest {
+   |            
+^^^^^^^^^^^^^^^^^^
+
+warning: function `se
+t_tracking_enabled` 
+is never used
+   --> src\services\a
+ctivity_tracker.rs:31
+1:8
+    |
+311 | pub fn set_trac
+king_enabled(enabled:
+ bool) {
+    |        
+^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is
+_tracking_enabled` 
+is never used
+   --> src\services\a
+ctivity_tracker.rs:31
+5:8
+    |
+315 | pub fn is_track
+ing_enabled() -> 
+bool {
+    |        
+^^^^^^^^^^^^^^^^^^^
+
+warning: function `se
+t_capture_enabled` 
+is never used
+  --> src\services\sc
+reen_capture.rs:88:8
+   |
+88 | pub fn set_captu
+re_enabled(enabled: 
+bool) {
+   |        
+^^^^^^^^^^^^^^^^^^^
+
+warning: struct 
+`ChatResponse` is 
+never constructed
+  --> src\services\qu
+ery_engine.rs:30:8
+   |
+30 | struct 
+ChatResponse {
+   |        
+^^^^^^^^^^^^
+
+warning: struct 
+`ChatChoice` is 
+never constructed
+  --> src\services\qu
+ery_engine.rs:35:8
+   |
+35 | struct 
+ChatChoice {
+   |        
+^^^^^^^^^^
+
+warning: struct 
+`ChatRecvMessage` is 
+never constructed
+  --> src\services\qu
+ery_engine.rs:40:8
+   |
+40 | struct 
+ChatRecvMessage {
+   |        
+^^^^^^^^^^^^^^^
+
+warning: field 
+`finish_reason` is 
+never read
+  --> src\services\qu
+ery_engine.rs:56:5
+   |
+53 | struct 
+ChatStreamChoice {
+   |        
+---------------- 
+field in this struct
+...
+56 |     
+finish_reason: 
+Option<String>,
+   |     
+^^^^^^^^^^^^^
+
+warning: function 
+`call_llm` is never 
+used
+    --> src\services\
+query_engine.rs:1244:
+10
+     |
+1244 | async fn 
+call_llm(model: 
+&str, api_key: &str, 
+messages: 
+&[ChatMessage]) -> 
+Result<String, 
+String> {
+     |          
+^^^^^^^^
+
+warning: 
+`intentflow` (bin 
+"intentflow") 
+generated 10 warnings
+    Finished `dev` 
+profile [unoptimized 
++ debuginfo] 
+target(s) in 10.83s
