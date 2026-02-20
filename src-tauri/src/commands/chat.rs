@@ -179,6 +179,7 @@ pub async fn send_chat_message(
     session_id: String,
     message: String,
     model: Option<String>,
+    time_range: Option<String>,
 ) -> Result<ChatMessageResponse, String> {
     let now = Utc::now().timestamp();
     let data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -233,11 +234,12 @@ pub async fn send_chat_message(
     let resolved_api_key = crate::utils::config::resolve_api_key(&settings.ai.api_key);
     
     let agent_result = if settings.ai.enabled && !resolved_api_key.is_empty() {
-        crate::services::query_engine::run_agentic_search_with_steps_and_history(
+        crate::services::query_engine::run_agentic_search_with_steps_and_history_and_scope(
             &app_handle,
             &message,
             &settings,
             &recent_context,
+            time_range.as_deref(),
         ).await
             .unwrap_or_else(|e| crate::services::query_engine::AgentResult {
                 answer: format!("Sorry, I encountered an error: {}", e),

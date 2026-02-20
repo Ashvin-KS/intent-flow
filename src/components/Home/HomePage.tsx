@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import type { PageType } from '../../App';
+import { motion } from 'framer-motion';
 import {
     Sun,
     CalendarCheck,
@@ -69,7 +70,6 @@ const summaryCards: SummaryCard[] = [
         iconBg: 'bg-purple-500/20',
         iconColor: 'text-purple-400',
         prompt: 'Create a detailed summary of my activity for the past week. Include which applications I used most, how much time I spent on different categories, and any notable patterns.',
-        isPro: true,
     },
     {
         id: 'top-of-mind',
@@ -88,7 +88,6 @@ const summaryCards: SummaryCard[] = [
         iconBg: 'bg-violet-500/20',
         iconColor: 'text-violet-400',
         prompt: 'Analyze my AI tool usage patterns. Which AI assistants and models have I been using? How often? What types of tasks do I use them for?',
-        isPro: true,
     },
     {
         id: 'discover',
@@ -137,8 +136,11 @@ export function HomePage({ onNavigate, onChatWithPrompt }: HomePageProps) {
                             Single-Click Summaries
                         </h2>
                         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                            {summaryCards.map((card) => (
-                                <button
+                            {summaryCards.map((card, index) => (
+                                <motion.button
+                                    initial={{ opacity: 0, y: 20 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    transition={{ duration: 0.4, delay: index * 0.05, ease: "easeOut" }}
                                     key={card.id}
                                     onClick={() => onChatWithPrompt(card.prompt)}
                                     className="group relative flex flex-col items-start gap-3 p-4 rounded-xl border border-dark-700/60 bg-dark-900 hover:bg-dark-800/80 hover:border-dark-600 transition-all duration-200 text-left"
@@ -160,7 +162,7 @@ export function HomePage({ onNavigate, onChatWithPrompt }: HomePageProps) {
                                             {card.description}
                                         </p>
                                     </div>
-                                </button>
+                                </motion.button>
                             ))}
                         </div>
                     </section>
@@ -173,7 +175,10 @@ export function HomePage({ onNavigate, onChatWithPrompt }: HomePageProps) {
                             </h2>
                             <RefreshCw className="w-3 h-3 text-dark-500 hover:text-dark-300 cursor-pointer transition-colors" />
                         </div>
-                        <button
+                        <motion.button
+                            initial={{ opacity: 0, y: 20 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            transition={{ duration: 0.4, delay: 0.3, ease: "easeOut" }}
                             onClick={() => onNavigate('chat')}
                             className="group flex items-center gap-3 w-full sm:w-auto px-5 py-3 rounded-xl border border-dark-700/60 bg-dark-900 hover:bg-dark-800/80 hover:border-dark-600 transition-all duration-200"
                             id="start-new-chat"
@@ -181,7 +186,7 @@ export function HomePage({ onNavigate, onChatWithPrompt }: HomePageProps) {
                             <MessageSquare className="w-5 h-5 text-emerald-400" />
                             <span className="text-sm font-medium text-emerald-400">Start New Chat</span>
                             <ArrowRight className="w-4 h-4 text-emerald-400 ml-auto opacity-0 group-hover:opacity-100 transition-opacity" />
-                        </button>
+                        </motion.button>
                     </section>
                 </div>
             </div>

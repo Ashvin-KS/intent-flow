@@ -1,7 +1,10 @@
 import { useEffect, useState } from 'react';
 import { RefreshCw, CalendarClock, FolderKanban, MessageCircle, Sparkles } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { Card, CardHeader, CardContent, Button } from '../common';
-import { getDashboardOverview, refreshDashboardOverview } from '../../services/tauri';
+import { getDashboardOverview, refreshDashboardOverview, summarizeContact, summarizeProject } from '../../services/tauri';
 import type { DashboardOverview, DashboardTask, ProjectOverview, ContactOverview } from '../../types';
 
 function formatTime(ts?: number): string {
@@ -40,23 +43,58 @@ export function PersonalDashboard() {
         load(false);
     }, []);
 
-    const openContactDetail = (item: ContactOverview) => {
+    const openContactDetail = async (item: ContactOverview) => {
         const when = item.last_seen ? formatTime(item.last_seen) : 'Unknown time';
         setDetailPopup({
             title: item.name,
-            summary: item.context || 'Communication activity detected.',
-            detail: `This contact summary is inferred from tracked communication app windows and OCR captures for today.`,
+            summary: 'Generating AI summary...',
+            detail: `Fetching recent interactions...`,
             when,
         });
+
+        try {
+            const summary = await summarizeContact(item.name);
+            setDetailPopup({
+                title: item.name,
+                summary: summary,
+                detail: `AI generated summary based on recent interactions.`,
+                when,
+            });
+        } catch (e) {
+            setDetailPopup({
+                title: item.name,
+                summary: item.context || 'Communication activity detected.',
+                detail: `Failed to generate AI summary: ${e instanceof Error ? e.message : String(e)}`,
+                when,
+            });
+        }
     };
 
-    const openProjectDetail = (item: ProjectOverview) => {
+    const openProjectDetail = async (item: ProjectOverview) => {
+        const when = data?.updated_at ? formatTime(data.updated_at) : 'Unknown time';
         setDetailPopup({
             title: item.name,
-            summary: item.update || `${item.files_changed} file change(s) detected today.`,
-            detail: `Project activity is grouped by project root using today's file monitor events.`,
-            when: data?.updated_at ? formatTime(data.updated_at) : 'Unknown time',
+            summary: 'Generating AI summary...',
+            detail: `Fetching recent file changes...`,
+            when,
         });
+
+        try {
+            const summary = await summarizeProject(item.name);
+            setDetailPopup({
+                title: item.name,
+                summary: summary,
+                detail: `AI generated summary based on recent file changes.`,
+                when,
+            });
+        } catch (e) {
+            setDetailPopup({
+                title: item.name,
+                summary: item.update || `${item.files_changed} file change(s) detected today.`,
+                detail: `Failed to generate AI summary: ${e instanceof Error ? e.message : String(e)}`,
+                when,
+            });
+        }
     };
 
     const openDeadlineDetail = (item: DashboardTask) => {
@@ -101,9 +139,11 @@ export function PersonalDashboard() {
                     {error ? (
                         <p className="text-sm text-red-400">{error}</p>
                     ) : (
-                        <p className="text-sm text-dark-200 leading-relaxed whitespace-pre-wrap break-words overflow-hidden">
-                            {data?.summary || 'No summary available yet.'}
-                        </p>
+                        <div className="text-sm text-dark-200 leading-relaxed whitespace-pre-wrap break-words overflow-hidden [&>p]:mb-4 [&>h3]:text-white [&>h3]:font-semibold [&>h3]:mb-2 [&>ul]:list-disc [&>ul]:pl-5 [&>ul]:mb-4 [&>ol]:list-decimal [&>ol]:pl-5 [&>ol]:mb-4 [&_strong]:text-white">
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                {data?.summary || 'No summary available yet.'}
+                            </ReactMarkdown>
+                        </div>
                     )}
                     {data?.focus_points && data.focus_points.length > 0 && (
                         <div className="mt-4 space-y-2">
@@ -158,9 +198,11 @@ export function PersonalDashboard() {
                                         <FolderKanban className="w-4 h-4 text-blue-400" />
                                         <p className="text-sm text-white truncate">{item.name}</p>
                                     </div>
-                                    <p className="text-xs text-dark-400 whitespace-pre-wrap break-all max-h-40 overflow-y-auto pr-1">
-                                        {item.update}
-                                    </p>
+                                    <div className="text-xs text-dark-400 whitespace-pre-wrap break-all max-h-40 overflow-y-auto pr-1 [&>p]:mb-2 [&>ul]:list-disc [&>ul]:pl-4 [&>ol]:list-decimal [&>ol]:pl-4 [&_strong]:text-white">
+                                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                            {item.update}
+                                        </ReactMarkdown>
+                                    </div>
                                 </button>
                             )) : (
                                 <p className="text-xs text-dark-500">No project activity detected yet.</p>
@@ -195,36 +237,49 @@ export function PersonalDashboard() {
                 </Card>
             </div>
 
-            {detailPopup && (
-                <div
-                    className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center px-4"
-                    onClick={() => setDetailPopup(null)}
-                >
-                    <div
-                        className="w-full max-w-md bg-dark-900 border border-dark-700 rounded-xl p-4 shadow-2xl"
-                        onClick={(e) => e.stopPropagation()}
+            <AnimatePresence>
+                {detailPopup && (
+                    <motion.div
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center px-4"
+                        onClick={() => setDetailPopup(null)}
                     >
-                        <div className="flex items-center justify-between mb-3">
-                            <h3 className="text-sm font-semibold text-white truncate pr-4">{detailPopup.title}</h3>
-                            <button
-                                onClick={() => setDetailPopup(null)}
-                                className="text-xs text-dark-400 hover:text-white"
-                            >
-                                Close
-                            </button>
-                        </div>
-                        <p className="text-sm text-dark-200 leading-relaxed">{detailPopup.summary}</p>
-                        {detailPopup.detail && (
-                            <p className="mt-3 text-xs text-dark-400 whitespace-pre-wrap leading-relaxed">
-                                {detailPopup.detail}
-                            </p>
-                        )}
-                        {detailPopup.when && (
-                            <p className="mt-3 text-[11px] text-dark-500">Last seen/updated: {detailPopup.when}</p>
-                        )}
-                    </div>
-                </div>
-            )}
+                        <motion.div
+                            initial={{ scale: 0.95, opacity: 0 }}
+                            animate={{ scale: 1, opacity: 1 }}
+                            exit={{ scale: 0.95, opacity: 0 }}
+                            transition={{ type: "spring", duration: 0.3 }}
+                            className="w-full max-w-md bg-dark-900 border border-dark-700 rounded-xl p-4 shadow-2xl"
+                            onClick={(e) => e.stopPropagation()}
+                        >
+                            <div className="flex items-center justify-between mb-3">
+                                <h3 className="text-sm font-semibold text-white truncate pr-4">{detailPopup.title}</h3>
+                                <button
+                                    onClick={() => setDetailPopup(null)}
+                                    className="text-xs text-dark-400 hover:text-white"
+                                >
+                                    Close
+                                </button>
+                            </div>
+                            <div className="text-sm text-dark-200 leading-relaxed max-h-[60vh] overflow-y-auto pr-2 [&>p]:mb-4 [&>h3]:text-white [&>h3]:font-semibold [&>h3]:mb-2 [&>ul]:list-disc [&>ul]:pl-5 [&>ul]:mb-4 [&>ol]:list-decimal [&>ol]:pl-5 [&>ol]:mb-4 [&_strong]:text-white">
+                                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                    {detailPopup.summary}
+                                </ReactMarkdown>
+                            </div>
+                            {detailPopup.detail && (
+                                <p className="mt-3 text-xs text-dark-400 whitespace-pre-wrap leading-relaxed">
+                                    {detailPopup.detail}
+                                </p>
+                            )}
+                            {detailPopup.when && (
+                                <p className="mt-3 text-[11px] text-dark-500">Last seen/updated: {detailPopup.when}</p>
+                            )}
+                        </motion.div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
         </div>
     );
 }

@@ -67,6 +67,8 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
     const [input, setInput] = useState('');
     const [isSending, setIsSending] = useState(false);
     const [streamingContent, setStreamingContent] = useState('');
+    const [agentStatus, setAgentStatus] = useState('');
+    const [displayedStatus, setDisplayedStatus] = useState('');
     const [showHistory, setShowHistory] = useState(true);
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -162,15 +164,44 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
 
     // Listen for streaming tokens
     useEffect(() => {
-        let unlisten: (() => void) | undefined;
+        let unlistenToken: (() => void) | undefined;
+        let unlistenStatus: (() => void) | undefined;
+        let unlistenDone: (() => void) | undefined;
         async function setupListener() {
-            unlisten = await listen<string>('chat://token', (event) => {
+            unlistenToken = await listen<string>('chat://token', (event) => {
                 setStreamingContent((prev) => prev + event.payload);
+            });
+            unlistenStatus = await listen<string>('chat://status', (event) => {
+                setAgentStatus(event.payload || '');
+            });
+            unlistenDone = await listen<string>('chat://done', () => {
+                setAgentStatus('');
+                setDisplayedStatus('');
             });
         }
         setupListener();
-        return () => { if (unlisten) unlisten(); };
+        return () => {
+            if (unlistenToken) unlistenToken();
+            if (unlistenStatus) unlistenStatus();
+            if (unlistenDone) unlistenDone();
+        };
     }, []);
+
+    useEffect(() => {
+        if (!agentStatus) {
+            setDisplayedStatus('');
+            return;
+        }
+        let i = 0;
+        const timer = window.setInterval(() => {
+            i = Math.min(i + 1, agentStatus.length);
+            setDisplayedStatus(agentStatus.slice(0, i));
+            if (i >= agentStatus.length) {
+                window.clearInterval(timer);
+            }
+        }, 12);
+        return () => window.clearInterval(timer);
+    }, [agentStatus]);
 
     const loadSessions = async () => {
         try {
@@ -237,6 +268,7 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
         setInput('');
         setIsSending(true);
         setStreamingContent('');
+        setAgentStatus('Preparing search...');
 
         const tempUserMsg: ChatMessageType = {
             id: Date.now(),
@@ -248,7 +280,12 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
         setMessages((prev) => [...prev, tempUserMsg]);
 
         try {
-            const response = await sendChatMessage(sessionId, messageText.trim(), selectedModel || undefined);
+            const response = await sendChatMessage(
+                sessionId,
+                messageText.trim(),
+                selectedModel || undefined,
+                selectedTimeRange
+            );
             if (selectedModel) {
                 const selected = favorites.find((f) => f.id === selectedModel);
                 addFavorite({ id: selectedModel, name: selected?.name || selectedModel });
@@ -268,6 +305,8 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
         } finally {
             setIsSending(false);
             setStreamingContent('');
+            setAgentStatus('');
+            setDisplayedStatus('');
         }
     };
 
@@ -607,8 +646,24 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
                                         <div className="bg-dark-800 rounded-2xl rounded-bl-md px-4 py-3 border border-dark-700">
                                             <div className="flex items-center gap-2">
                                                 <Loader2 className="w-4 h-4 animate-spin" />
-                                                <span className="text-sm">Thinking...</span>
+                                                <span className="text-sm">
+                                                    {displayedStatus || agentStatus || 'Thinking...'}
+                                                    <span className="inline-flex ml-1">
+                                                        <span className="animate-pulse">.</span>
+                                                        <span className="animate-pulse [animation-delay:120ms]">.</span>
+                                                        <span className="animate-pulse [animation-delay:240ms]">.</span>
+                                                    </span>
+                                                </span>
                                             </div>
+                                        </div>
+                                    </div>
+                                )}
+                                {isSending && agentStatus && streamingContent && (
+                                    <div className="flex items-center gap-2 text-dark-500 mb-4">
+                                        <div className="bg-dark-900/70 rounded-xl px-3 py-2 border border-dark-800">
+                                            <span className="text-xs">
+                                                {displayedStatus || agentStatus}
+                                            </span>
                                         </div>
                                     </div>
                                 )}

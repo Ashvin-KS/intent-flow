@@ -24,3 +24,19 @@ pub async fn refresh_dashboard_overview(
 ) -> Result<DashboardOverview, String> {
     crate::services::dashboard_engine::refresh_dashboard_snapshot(&app_handle).await
 }
+
+#[tauri::command]
+pub async fn summarize_contact(
+    app_handle: AppHandle,
+    name: String,
+) -> Result<String, String> {
+    crate::services::dashboard_engine::summarize_contact(&app_handle, &name).await
+}
+
+#[tauri::command]
+pub async fn summarize_project(
+    app_handle: AppHandle,
+    name: String,
+) -> Result<String, String> {
+    crate::services::dashboard_engine::summarize_project(&app_handle, &name).await
+}

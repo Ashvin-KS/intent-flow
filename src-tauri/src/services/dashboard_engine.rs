@@ -73,15 +73,23 @@ pub async fn refresh_dashboard_snapshot(app_handle: &AppHandle) -> Result<Dashbo
     let now = chrono::Utc::now().timestamp();
 
     let mut overview = if settings.ai.enabled && !api_key.is_empty() {
-        ai_dashboard_summary(&context, &api_key, &model).await.unwrap_or_else(|_| fallback_dashboard_summary(&context))
+        match ai_dashboard_summary(&context, &api_key, &model).await {
+            Ok(o) => o,
+            Err(e) => {
+                let mut fallback = fallback_dashboard_summary(&context);
+                fallback.summary = format!("{}\n\n(AI Summary Failed: {})", fallback.summary, e);
+                fallback
+            }
+        }
     } else {
-        fallback_dashboard_summary(&context)
+        let mut fallback = fallback_dashboard_summary(&context);
+        if api_key.is_empty() {
+            fallback.summary = format!("{}\n\n(AI Summary disabled: No API key provided)", fallback.summary);
+        } else if !settings.ai.enabled {
+            fallback.summary = format!("{}\n\n(AI Summary disabled in settings)", fallback.summary);
+        }
+        fallback
     };
-
-    let chat_recap = build_chat_recap(&context);
-    if !chat_recap.is_empty() && !overview.summary.to_lowercase().contains("chat recap") {
-        overview.summary = format!("{}\n\nChat recap: {}", overview.summary.trim(), chat_recap);
-    }
 
     overview.projects = enrich_projects_with_file_upgrades(&context, overview.projects);
 
@@ -318,14 +326,14 @@ async fn ai_dashboard_summary(
         "Build a personal dashboard from today's data only.\n\
 Return strict JSON with keys: summary (string), focus_points (string[]), deadlines ([{{title,due_date,status,source}}]), \
 projects ([{{name,update,files_changed}}]), contacts ([{{name,context,last_seen}}]).\n\
-Keep response factual and concise.\n\n\
+Keep response factual and concise. The summary should be a comprehensive paragraph summarizing the user's overall activity, including project updates, file changes, music/songs listened to (if any), ongoing projects, and chat interactions.\n\n\
 Top apps: {:?}\n\
 Total tracked seconds: {}\n\
 Entries: {:?}\n\
 Recent file changes: {:?}\n\
 OCR snippets: {:?}\n\
 Communication events: {:?}\n\
-Chat turns (user -> assistant): {:?}",
+Chat turns: {:?}",
         context.top_apps,
         context.total_duration,
         context.entries,
@@ -373,7 +381,9 @@ Chat turns (user -> assistant): {:?}",
         .first()
         .and_then(|c| c.message.content.clone())
         .ok_or_else(|| "dashboard AI returned empty content".to_string())?;
-    let payload: DashboardLLMOutput = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+        
+    let clean_content = content.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    let payload: DashboardLLMOutput = serde_json::from_str(clean_content).map_err(|e| format!("JSON parse error: {} - Content: {}", e, clean_content))?;
 
     Ok(DashboardOverview {
         date_key: String::new(),
@@ -398,12 +408,6 @@ fn fallback_dashboard_summary(context: &TodayContext) -> DashboardOverview {
             .collect::<Vec<_>>()
             .join(", ");
         format!("Today you mostly worked in {}.", apps)
-    };
-    let chat_recap = build_chat_recap(context);
-    let summary = if chat_recap.is_empty() {
-        summary
-    } else {
-        format!("{}\n\nChat recap: {}", summary, chat_recap)
     };
 
     let deadlines = context
@@ -710,14 +714,30 @@ fn enrich_projects_with_file_upgrades(
 
     let mut merged = existing;
     for item in &mut merged {
-        if let Some(c) = computed_map.get(&item.name) {
-            item.files_changed = c.files_changed;
-            item.update = c.update.clone();
+        // Try to find a matching project by checking if the computed path ends with the LLM project name
+        let matched_key = computed_map.keys().find(|k| {
+            let k_lower = k.to_lowercase();
+            let item_lower = item.name.to_lowercase();
+            k_lower.ends_with(&item_lower) || item_lower.ends_with(&k_lower) || k_lower.contains(&item_lower)
+        }).cloned();
+
+        if let Some(key) = matched_key {
+            if let Some(c) = computed_map.remove(&key) {
+                item.files_changed = c.files_changed;
+                item.update = c.update.clone();
+                // Optionally update the name to the more descriptive one or keep the LLM one
+            }
         }
     }
 
     for (_, c) in computed_map {
-        if !merged.iter().any(|m| m.name.eq_ignore_ascii_case(&c.name)) {
+        // Double check just in case
+        let exists = merged.iter().any(|m| {
+            let m_lower = m.name.to_lowercase();
+            let c_lower = c.name.to_lowercase();
+            c_lower.ends_with(&m_lower) || m_lower.ends_with(&c_lower) || c_lower.contains(&m_lower)
+        });
+        if !exists {
             merged.push(c);
         }
     }
@@ -855,4 +875,165 @@ fn today_bounds_local() -> (String, i64, i64) {
     let start = start_local.timestamp();
     let end = start + 24 * 3600;
     (date.format("%Y-%m-%d").to_string(), start, end)
+}
+
+async fn call_llm_for_summary(api_key: &str, model: &str, prompt: &str) -> Result<String, String> {
+    let request = DashboardChatRequest {
+        model: model.to_string(),
+        messages: vec![
+            DashboardChatMessage {
+                role: "system".to_string(),
+                content: "You are a helpful assistant that summarizes context into a concise, readable paragraph. Do not use markdown formatting like bold or italics, just plain text.".to_string(),
+            },
+            DashboardChatMessage {
+                role: "user".to_string(),
+                content: prompt.to_string(),
+            },
+        ],
+        temperature: 0.3,
+        max_tokens: 300,
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://integrate.api.nvidia.com/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("API request failed: {}", e))?;
+
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("API error {}: {}", status, text));
+    }
+
+    let parsed: DashboardChatResponse = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let content = parsed
+        .choices
+        .first()
+        .and_then(|c| c.message.content.clone())
+        .ok_or_else(|| "AI returned empty content".to_string())?;
+    
+    Ok(content.trim().to_string())
+}
+
+pub async fn summarize_contact(app_handle: &AppHandle, name: &str) -> Result<String, String> {
+    let settings = load_settings(app_handle).unwrap_or_default();
+    let api_key = crate::utils::config::resolve_api_key(&settings.ai.api_key);
+    let model = settings.ai.model.clone();
+
+    if !settings.ai.enabled || api_key.is_empty() {
+        return Ok(format!("AI is disabled or API key is missing. Cannot summarize {}.", name));
+    }
+
+    let mut context_data = Vec::new();
+    {
+        let data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+        let db_path = data_dir.join("intentflow.db");
+        let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+
+        let now = chrono::Local::now().timestamp();
+        let start = now - (3 * 24 * 3600);
+
+        let mut stmt = conn.prepare(
+            "SELECT app_name, window_title, metadata 
+             FROM activities 
+             WHERE start_time >= ?1 AND start_time < ?2 
+             AND (window_title LIKE ?3 OR metadata LIKE ?3)
+             ORDER BY start_time DESC LIMIT 50"
+        ).map_err(|e| e.to_string())?;
+
+        let name_pattern = format!("%{}%", name);
+        let rows = stmt.query_map(rusqlite::params![start, now, name_pattern], |row| {
+            let app: String = row.get(0)?;
+            let title: String = row.get(1)?;
+            let metadata: Option<Vec<u8>> = row.get(2)?;
+            let ocr = metadata
+                .as_ref()
+                .and_then(|blob| serde_json::from_slice::<ActivityMetadata>(blob).ok())
+                .and_then(|m| m.screen_text)
+                .unwrap_or_default();
+            Ok((app, title, ocr))
+        }).map_err(|e| e.to_string())?;
+
+        for row in rows.filter_map(|r| r.ok()) {
+            let ocr_snippet = row.2.chars().take(200).collect::<String>();
+            let clean_ocr = ocr_snippet.replace('\n', " ");
+            context_data.push(format!("App: {}, Title: {}, OCR: {}", row.0, row.1, clean_ocr));
+        }
+    }
+
+    if context_data.is_empty() {
+        return Ok(format!("No recent interactions found for {}.", name));
+    }
+
+    let prompt = format!(
+        "Summarize the recent interactions and context for the contact '{}'.\n\
+        Keep it concise, factual, and highlight any action items or key topics discussed.\n\n\
+        Recent data:\n{}",
+        name,
+        context_data.join("\n")
+    );
+
+    call_llm_for_summary(&api_key, &model, &prompt).await
+}
+
+pub async fn summarize_project(app_handle: &AppHandle, name: &str) -> Result<String, String> {
+    let settings = load_settings(app_handle).unwrap_or_default();
+    let api_key = crate::utils::config::resolve_api_key(&settings.ai.api_key);
+    let model = settings.ai.model.clone();
+
+    if !settings.ai.enabled || api_key.is_empty() {
+        return Ok(format!("AI is disabled or API key is missing. Cannot summarize {}.", name));
+    }
+
+    let mut context_data = Vec::new();
+    {
+        let data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+        let db_path = data_dir.join("intentflow.db");
+        let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+
+        let now = chrono::Local::now().timestamp();
+        let start = now - (3 * 24 * 3600);
+
+        let mut stmt = conn.prepare(
+            "SELECT path, entity_type, change_type, COALESCE(content_preview, '')
+             FROM code_file_events 
+             WHERE detected_at >= ?1 AND detected_at < ?2 
+             AND project_root LIKE ?3
+             ORDER BY detected_at DESC LIMIT 100"
+        ).map_err(|e| e.to_string())?;
+
+        let name_pattern = format!("%{}%", name);
+        let rows = stmt.query_map(rusqlite::params![start, now, name_pattern], |row| {
+            let path: String = row.get(0)?;
+            let entity_type: String = row.get(1)?;
+            let change_type: String = row.get(2)?;
+            let preview: String = row.get(3)?;
+            Ok((path, entity_type, change_type, preview))
+        }).map_err(|e| e.to_string())?;
+
+        for row in rows.filter_map(|r| r.ok()) {
+            let preview_snippet = row.3.chars().take(150).collect::<String>();
+            let clean_preview = preview_snippet.replace('\n', " ");
+            context_data.push(format!("File: {} ({}), Change: {}, Preview: {}", row.0, row.1, row.2, clean_preview));
+        }
+    }
+
+    if context_data.is_empty() {
+        return Ok(format!("No recent file changes found for project {}.", name));
+    }
+
+    let prompt = format!(
+        "Summarize the recent development activity for the project '{}'.\n\
+        Keep it concise, factual, and highlight the main areas of work or features being developed based on the file changes.\n\n\
+        Recent data:\n{}",
+        name,
+        context_data.join("\n")
+    );
+
+    call_llm_for_summary(&api_key, &model, &prompt).await
 }

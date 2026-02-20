@@ -197,8 +197,13 @@ export async function getChatMessages(sessionId: string): Promise<ChatMessage[]>
   return invoke('get_chat_messages', { sessionId });
 }
 
-export async function sendChatMessage(sessionId: string, message: string, model?: string): Promise<ChatMessage> {
-  return invoke('send_chat_message', { sessionId, message, model });
+export async function sendChatMessage(
+  sessionId: string,
+  message: string,
+  model?: string,
+  timeRange?: string
+): Promise<ChatMessage> {
+  return invoke('send_chat_message', { sessionId, message, model, timeRange });
 }
 
 // Dashboard commands
@@ -208,5 +213,13 @@ export async function getDashboardOverview(refresh = false): Promise<DashboardOv
 
 export async function refreshDashboardOverview(): Promise<DashboardOverview> {
   return invoke('refresh_dashboard_overview');
+}
+
+export async function summarizeContact(name: string): Promise<string> {
+  return invoke('summarize_contact', { name });
+}
+
+export async function summarizeProject(name: string): Promise<string> {
+  return invoke('summarize_project', { name });
 }
 

@@ -3,11 +3,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::models::{Settings, ActivityMetadata};
 use tauri::{Manager, Emitter};
+use chrono::{Duration, Local, TimeZone};
+use std::time::Duration as StdDuration;
 
 // ─── Constants ───
 
-const MAX_TURNS: usize = 7;
+const MAX_TURNS: usize = 20;
 const MAX_TOOL_RETRY_LOOPS: usize = 3;
+const LLM_TIMEOUT_SECS: u64 = 60;
 
 // ─── Types ───
 
@@ -75,7 +78,7 @@ You have access to the user's activity history (apps, windows, duration, time) a
    - Returns formatted list of songs with title, artist, app, and time
 
 2. `get_recent_activities` - For events/tasks/recent activity timeline
-   - Args: hours (default 24), limit (default 40), category_id (optional)
+   - Args: hours (default 24), limit (default 100), category_id (optional)
    - Returns chronological activity events with app, title, category, duration, and time
 
 3. `query_activities` - SQL queries on the `activities` table
@@ -86,10 +89,10 @@ You have access to the user's activity history (apps, windows, duration, time) a
    - Args: start_time_iso, end_time_iso
 
 5. `search_ocr` - Search screen text content
-   - Args: keyword, limit
+   - Args: keyword, limit (default 100)
 
 6. `get_recent_ocr` - Browse recent OCR captures (including chats) without exact keyword
-   - Args: hours (default 24), limit (default 20), app (optional), keyword (optional)
+   - Args: hours (default 24), limit (default 100), app (optional), keyword (optional)
    - Returns recent OCR snippets with app and timestamp
 
 7. `get_recent_file_changes` - Recent code/document file changes from monitored project roots
@@ -114,10 +117,16 @@ You have access to the user's activity history (apps, windows, duration, time) a
 8. For coding progress or project-change questions, use get_recent_file_changes.
 9. For broad/ambiguous requests, prefer parallel_search with 2-3 tool calls
 10. Use conversation history to resolve references like "it", "that", "the previous one", "what was it about".
+11. Never claim facts without tool evidence from the requested time scope.
+12. If evidence is weak or contradictory, ask a clarifying date/day question instead of guessing.
+13. For "what am I hearing right now", rely only on very recent records marked as Playing.
+14. For underspecified queries (missing source/app or time intent), ask a short clarifying question before searching.
+15. If you are asked about people, names, or girls, use `search_ocr` with a high limit and try different keywords or no keywords at all to get all the data.
+16. If you are asked about chats, use `get_recent_ocr` with a high limit and try different apps like "whatsapp", "instagram", "telegram", etc.
 
 ## Response Format
 Output JSON for tool calls: { "tool": "tool_name", "args": { ... }, "reasoning": "..." }
-Output plain text for final answers (no JSON, no markdown, no **bold** markers).
+Output detailed, crisp, and highly specific final answers. Use markdown (like bolding and bullet points) to make the answer easy to read.
 
 Do NOT output markdown code blocks for tool calls. Output RAW JSON only.
 
@@ -142,6 +151,23 @@ enum AgentResponse {
     FinalAnswer(String),
 }
 
+#[derive(Clone, Debug)]
+struct TimeScope {
+    id: String,
+    label: String,
+    start_ts: i64,
+    end_ts: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct QueryIntent {
+    wants_music: bool,
+    wants_ocr: bool,
+    wants_files: bool,
+    wants_timeline: bool,
+    broad_summary: bool,
+}
+
 // ─── Public API ───
 
 pub async fn run_agentic_search(
@@ -150,7 +176,7 @@ pub async fn run_agentic_search(
     settings: &Settings,
 ) -> Result<String, String> {
     // Delegate to the step-tracking version, just return the answer
-    let result = run_agentic_search_with_steps(app_handle, user_query, settings).await?;
+    let result = run_agentic_search_with_steps_and_scope(app_handle, user_query, settings, None).await?;
     Ok(result.answer)
 }
 
@@ -177,7 +203,22 @@ pub async fn run_agentic_search_with_steps(
     user_query: &str,
     settings: &Settings,
 ) -> Result<AgentResult, String> {
-    run_agentic_search_with_steps_and_history(app_handle, user_query, settings, &[]).await
+    run_agentic_search_with_steps_and_scope(app_handle, user_query, settings, None).await
+}
+
+pub async fn run_agentic_search_with_steps_and_scope(
+    app_handle: &tauri::AppHandle,
+    user_query: &str,
+    settings: &Settings,
+    time_scope: Option<&str>,
+) -> Result<AgentResult, String> {
+    run_agentic_search_with_steps_and_history_and_scope(
+        app_handle,
+        user_query,
+        settings,
+        &[],
+        time_scope,
+    ).await
 }
 
 pub async fn run_agentic_search_with_steps_and_history(
@@ -185,6 +226,22 @@ pub async fn run_agentic_search_with_steps_and_history(
     user_query: &str,
     settings: &Settings,
     prior_messages: &[ChatMessage],
+) -> Result<AgentResult, String> {
+    run_agentic_search_with_steps_and_history_and_scope(
+        app_handle,
+        user_query,
+        settings,
+        prior_messages,
+        None,
+    ).await
+}
+
+pub async fn run_agentic_search_with_steps_and_history_and_scope(
+    app_handle: &tauri::AppHandle,
+    user_query: &str,
+    settings: &Settings,
+    prior_messages: &[ChatMessage],
+    time_scope: Option<&str>,
 ) -> Result<AgentResult, String> {
     let api_key = crate::utils::config::resolve_api_key(&settings.ai.api_key);
     let model = &settings.ai.model;
@@ -198,6 +255,8 @@ pub async fn run_agentic_search_with_steps_and_history(
     
     let mut steps: Vec<AgentStep> = Vec::new();
     let mut all_activities: Vec<Value> = Vec::new();
+    let resolved_scope = resolve_time_scope(time_scope, user_query);
+    let intent = detect_query_intent(user_query);
     
     // Initial messages
     let mut messages = vec![ChatMessage {
@@ -223,10 +282,43 @@ pub async fn run_agentic_search_with_steps_and_history(
 
     messages.push(ChatMessage {
         role: "user".to_string(),
-        content: format!("User query: \"{}\"\nCurrent Time: {}", user_query, chrono::Local::now().to_rfc3339()),
+        content: format!(
+            "User query: \"{}\"\nCurrent Time: {}\nSelected Time Scope: {} ({} to {})\nAlways keep retrieval strictly inside this scope unless the user asks to change it. If you need to search for people, names, or girls, use `search_ocr` with a high limit and try different keywords or no keywords at all to get all the data. If you need to search for chats, use `get_recent_ocr` with a high limit and try different apps like \"whatsapp\", \"instagram\", \"telegram\", etc.",
+            user_query,
+            chrono::Local::now().to_rfc3339(),
+            resolved_scope.label,
+            format_time_scope_ts(resolved_scope.start_ts),
+            format_time_scope_ts(resolved_scope.end_ts)
+        ),
     });
 
+    if intent.broad_summary {
+        let prefetch_args = build_prefetch_parallel_args(&resolved_scope, &intent);
+        if let Ok((prefetch_output, prefetch_activities)) =
+            execute_parallel_search(&db_path, &prefetch_args, Some(&resolved_scope), user_query)
+        {
+            if !prefetch_activities.is_empty() {
+                all_activities.extend(prefetch_activities);
+            }
+            steps.push(AgentStep {
+                turn: 0,
+                tool_name: "parallel_search".to_string(),
+                tool_args: prefetch_args,
+                tool_result: truncate_for_token_limit(&prefetch_output, 4000),
+                reasoning: "Prefetch evidence for broad multi-source summary".to_string(),
+            });
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: format!(
+                    "Prefetched evidence before tool-planning:\n{}",
+                    truncate_for_token_limit(&prefetch_output, 3500)
+                ),
+            });
+        }
+    }
+
     for turn in 0..MAX_TURNS {
+        let _ = app_handle.emit("chat://status", format!("Thinking (step {}/{})", turn + 1, MAX_TURNS));
         // 1. Call LLM with streaming callback
         // We accumulate the full content here, while also streaming it to the frontend
         let mut full_response = String::new();
@@ -259,14 +351,17 @@ pub async fn run_agentic_search_with_steps_and_history(
             AgentResponse::FinalAnswer(answer) => {
                 // Done!
                 let _ = app_handle.emit("chat://done", "final_answer");
+                let normalized = normalize_final_answer(&answer);
                 return Ok(AgentResult {
-                    answer: normalize_final_answer(&answer),
+                    answer: normalized,
                     steps,
                     activities_referenced: all_activities,
                 });
             }
             AgentResponse::ToolCall { tool, args, reasoning } => {
-                println!("[Agent] Turn {}: Calling {} ({:?})", turn + 1, tool, args);
+                let enforced_args = enforce_tool_args_with_scope(&tool, &args, &resolved_scope, user_query);
+                println!("[Agent] Turn {}: Calling {} ({:?})", turn + 1, tool, enforced_args);
+                let _ = app_handle.emit("chat://status", format!("Running {}", tool));
                 // Notify frontend of agent step (tool call) start?
                 // For now, frontend just sees tokens.
                 
@@ -278,7 +373,7 @@ pub async fn run_agentic_search_with_steps_and_history(
 
                 // Execute tool with bounded retry loops and optional parallelization
                 let (tool_output, tool_activities, attempts_used) = if tool == "parallel_search" {
-                    let parallel_count = args
+                    let parallel_count = enforced_args
                         .get("calls")
                         .and_then(|v| v.as_array())
                         .map(|v| v.len())
@@ -287,15 +382,25 @@ pub async fn run_agentic_search_with_steps_and_history(
                         "chat://token",
                         format!("\n[Agent] Running {} searches in parallel...\n", parallel_count),
                     );
-                    let (out, activities) = execute_parallel_search(&db_path, &args)?;
+                    let (out, activities) = execute_parallel_search(
+                        &db_path,
+                        &enforced_args,
+                        Some(&resolved_scope),
+                        user_query,
+                    )?;
                     (out, activities, 1usize)
                 } else {
                     let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
-                    execute_tool_with_retries(&conn, &tool, &args, MAX_TOOL_RETRY_LOOPS)?
+                    execute_tool_with_retries(&conn, &tool, &enforced_args, MAX_TOOL_RETRY_LOOPS)?
                 };
 
                 // Add activities from tool result to referenced activities
                 all_activities.extend(transform_activities_for_frontend(&tool, &tool_activities));
+                dedupe_activities(&mut all_activities);
+                let _ = app_handle.emit(
+                    "chat://status",
+                    format!("{} completed ({} referenced items)", tool, tool_activities.len())
+                );
                 
                 // Truncate output if too long to save tokens
                 let with_retry_note = if attempts_used > 1 {
@@ -313,7 +418,7 @@ pub async fn run_agentic_search_with_steps_and_history(
                 steps.push(AgentStep {
                     turn: turn + 1,
                     tool_name: tool.clone(),
-                    tool_args: args.clone(),
+                    tool_args: enforced_args.clone(),
                     tool_result: truncated_output.clone(),
                     reasoning: reasoning.as_deref().unwrap_or("").to_string(),
                 });
@@ -327,14 +432,288 @@ pub async fn run_agentic_search_with_steps_and_history(
         }
     }
 
-    Ok(AgentResult {
-        answer: "I reached the maximum number of steps without finding a definitive answer. Please try a more specific query.".to_string(),
-        steps,
-        activities_referenced: all_activities,
-    })
+    let _ = app_handle.emit("chat://status", "Finalizing answer from gathered evidence...");
+    let answer = synthesize_answer_from_evidence(
+        app_handle,
+        model,
+        &api_key,
+        user_query,
+        &resolved_scope,
+        &steps,
+        &all_activities,
+    ).await.unwrap_or_else(|_| "I checked your activity and found partial evidence, but not enough for a fully confident answer. Ask with a specific date/app and I will give exact details.".to_string());
+    Ok(AgentResult { answer, steps, activities_referenced: all_activities })
 }
 
 // ─── Tool Execution ───
+
+fn detect_query_intent(query: &str) -> QueryIntent {
+    let q = query.to_lowercase();
+    let wants_music = q.contains("song")
+        || q.contains("music")
+        || q.contains("spotify")
+        || q.contains("hearing")
+        || q.contains("listen");
+    let wants_ocr = q.contains("ocr")
+        || q.contains("whatsapp")
+        || q.contains("chat")
+        || q.contains("text")
+        || q.contains("instagram");
+    let wants_files = q.contains("file")
+        || q.contains("code")
+        || q.contains("project")
+        || q.contains("document")
+        || q.contains("change");
+    let wants_timeline = q.contains("timeline")
+        || q.contains("what did i do")
+        || q.contains("activity")
+        || q.contains("summary")
+        || q.contains("overview");
+    let broad_summary = q.contains("full summary")
+        || q.contains("don't leave anything")
+        || q.contains("dont leave anything")
+        || q.contains("everything")
+        || q.contains("today")
+        || q.contains("yesterday")
+        || (wants_timeline && (wants_ocr || wants_files || wants_music));
+
+    QueryIntent {
+        wants_music,
+        wants_ocr,
+        wants_files,
+        wants_timeline,
+        broad_summary,
+    }
+}
+
+fn query_has_time_hint(query: &str) -> bool {
+    let q = query.to_lowercase();
+    q.contains("today")
+        || q.contains("yesterday")
+        || q.contains("last ")
+        || q.contains("past ")
+        || q.contains("this week")
+        || q.contains("this month")
+        || q.contains("right now")
+        || q.contains("few mins")
+        || q.chars().any(|c| c.is_ascii_digit())
+}
+
+fn parse_scope_id_from_query(query: &str) -> Option<&'static str> {
+    let q = query.to_lowercase();
+    if q.contains("yesterday")
+        || q.contains("yesteray")
+        || q.contains("yeterday")
+        || q.contains("yestarday")
+    {
+        return Some("yesterday");
+    }
+    if q.contains("last 3 day") || q.contains("past 3 day") {
+        return Some("last_3_days");
+    }
+    if q.contains("last 7 day") || q.contains("past week") || q.contains("last week") {
+        return Some("last_7_days");
+    }
+    if q.contains("last 30 day") || q.contains("past month") || q.contains("last month") {
+        return Some("last_30_days");
+    }
+    if q.contains("all time") || q.contains("ever") || q.contains("across all days") {
+        return Some("all_time");
+    }
+    if q.contains("today") || q.contains("so far") {
+        return Some("today");
+    }
+    None
+}
+
+fn local_day_bounds(days_ago: i64) -> Option<(i64, i64)> {
+    let now = Local::now();
+    let target_date = now.date_naive() - Duration::days(days_ago);
+    let start_naive = target_date.and_hms_opt(0, 0, 0)?;
+    let end_naive = target_date.and_hms_opt(23, 59, 59)?;
+    let tz = now.timezone();
+    let start = tz.from_local_datetime(&start_naive).single()?.timestamp();
+    let end = tz.from_local_datetime(&end_naive).single()?.timestamp();
+    Some((start, end))
+}
+
+fn resolve_time_scope(explicit_scope: Option<&str>, query: &str) -> TimeScope {
+    let now = chrono::Utc::now().timestamp();
+    let scope_id = explicit_scope
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_lowercase())
+        .or_else(|| parse_scope_id_from_query(query).map(|s| s.to_string()))
+        .unwrap_or_else(|| "today".to_string());
+
+    match scope_id.as_str() {
+        "yesterday" => {
+            let (start_ts, end_ts) = local_day_bounds(1).unwrap_or((now - 86400, now));
+            TimeScope { id: scope_id, label: "Yesterday".to_string(), start_ts, end_ts }
+        }
+        "last_3_days" => {
+            let start_ts = local_day_bounds(2).map(|(s, _)| s).unwrap_or(now - 3 * 86400);
+            TimeScope { id: scope_id, label: "Last 3 Days".to_string(), start_ts, end_ts: now }
+        }
+        "last_7_days" => {
+            let start_ts = local_day_bounds(6).map(|(s, _)| s).unwrap_or(now - 7 * 86400);
+            TimeScope { id: scope_id, label: "Last 7 Days".to_string(), start_ts, end_ts: now }
+        }
+        "last_30_days" => {
+            let start_ts = local_day_bounds(29).map(|(s, _)| s).unwrap_or(now - 30 * 86400);
+            TimeScope { id: scope_id, label: "Last 30 Days".to_string(), start_ts, end_ts: now }
+        }
+        "all_time" => TimeScope {
+            id: scope_id,
+            label: "All Time".to_string(),
+            start_ts: 0,
+            end_ts: now,
+        },
+        _ => {
+            let start_ts = local_day_bounds(0).map(|(s, _)| s).unwrap_or(now - 86400);
+            TimeScope { id: "today".to_string(), label: "Today".to_string(), start_ts, end_ts: now }
+        }
+    }
+}
+
+fn format_time_scope_ts(ts: i64) -> String {
+    if ts <= 0 {
+        return "beginning".to_string();
+    }
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|dt| dt.with_timezone(&Local).format("%b %d, %Y %I:%M %p").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn enforce_tool_args_with_scope(tool: &str, args: &Value, scope: &TimeScope, user_query: &str) -> Value {
+    if tool == "parallel_search" {
+        let mut next = args.clone();
+        let root = match next.as_object_mut() {
+            Some(v) => v,
+            None => return args.clone(),
+        };
+        if let Some(calls) = root.get_mut("calls").and_then(|v| v.as_array_mut()) {
+            for call in calls {
+                let Some(call_obj) = call.as_object_mut() else { continue; };
+                let call_tool = call_obj
+                    .get("tool")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let base_args = call_obj.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+                call_obj.insert(
+                    "args".to_string(),
+                    enforce_tool_args_with_scope(&call_tool, &base_args, scope, user_query),
+                );
+            }
+        }
+        return next;
+    }
+
+    let mut next = args.clone();
+    let Some(obj) = next.as_object_mut() else {
+        return args.clone();
+    };
+
+    obj.insert("start_ts".to_string(), serde_json::json!(scope.start_ts));
+    obj.insert("end_ts".to_string(), serde_json::json!(scope.end_ts));
+    obj.insert("scope_label".to_string(), serde_json::json!(scope.label));
+
+    let span_seconds = (scope.end_ts - scope.start_ts).max(0);
+    let span_hours = ((span_seconds + 3599) / 3600).max(1);
+    obj.insert("hours".to_string(), serde_json::json!(span_hours));
+
+    if tool == "get_recent_activities" && !detect_query_intent(user_query).wants_music {
+        obj.insert("exclude_media_noise".to_string(), Value::Bool(true));
+    }
+
+    if tool == "get_usage_stats" {
+        let start_iso = chrono::DateTime::from_timestamp(scope.start_ts, 0)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+        let end_iso = chrono::DateTime::from_timestamp(scope.end_ts, 0)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        obj.insert("start_time_iso".to_string(), Value::String(start_iso));
+        obj.insert("end_time_iso".to_string(), Value::String(end_iso));
+    }
+
+    next
+}
+
+fn resolve_window_from_args(args: &Value, default_hours: i64) -> (i64, i64) {
+    let now = chrono::Utc::now().timestamp();
+    let hours = args["hours"].as_u64().unwrap_or(default_hours as u64) as i64;
+    let mut start_ts = args.get("start_ts").and_then(|v| v.as_i64()).unwrap_or(now - hours * 3600);
+    let mut end_ts = args.get("end_ts").and_then(|v| v.as_i64()).unwrap_or(now);
+
+    if end_ts <= 0 {
+        end_ts = now;
+    }
+    if start_ts < 0 {
+        start_ts = 0;
+    }
+    if start_ts > end_ts {
+        std::mem::swap(&mut start_ts, &mut end_ts);
+    }
+    (start_ts, end_ts)
+}
+
+fn build_prefetch_parallel_args(scope: &TimeScope, intent: &QueryIntent) -> Value {
+    let mut calls = vec![serde_json::json!({
+        "tool": "get_recent_activities",
+        "args": {
+            "limit": if scope.id == "all_time" { 120 } else { 80 },
+            "exclude_media_noise": !intent.wants_music
+        }
+    })];
+
+    if intent.wants_ocr || intent.broad_summary {
+        calls.push(serde_json::json!({
+            "tool": "get_recent_ocr",
+            "args": { "limit": if scope.id == "all_time" { 80 } else { 50 } }
+        }));
+    }
+
+    if intent.wants_files || intent.wants_timeline || intent.broad_summary {
+        calls.push(serde_json::json!({
+            "tool": "get_recent_file_changes",
+            "args": { "limit": if scope.id == "all_time" { 80 } else { 40 } }
+        }));
+    }
+
+    if intent.wants_music {
+        calls.push(serde_json::json!({
+            "tool": "get_music_history",
+            "args": { "limit": if scope.id == "all_time" { 80 } else { 40 } }
+        }));
+    }
+
+    serde_json::json!({ "calls": calls })
+}
+
+fn dedupe_activities(activities: &mut Vec<Value>) {
+    let mut seen = std::collections::HashSet::new();
+    activities.retain(|item| {
+        let app = item.get("app").and_then(|v| v.as_str()).unwrap_or_default();
+        let title = item.get("title").and_then(|v| v.as_str()).unwrap_or_default();
+        let time = item.get("time").and_then(|v| v.as_i64()).unwrap_or_default();
+        let key = format!("{}|{}|{}", app, title, time);
+        seen.insert(key)
+    });
+}
+
+fn is_media_noise_event(event: &Value) -> bool {
+    let Some(media) = event.get("media_info").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    let title = media.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if title.is_empty() {
+        return false;
+    }
+    let app_name = event.get("app_name").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+    // Keep direct player rows, filter incidental "now playing" reflections from other windows.
+    !(app_name.contains("spotify") || app_name.contains("youtube") || app_name.contains("music"))
+}
 
 fn is_low_signal_result(tool: &str, output: &str, activities: &[Value]) -> bool {
     if !activities.is_empty() {
@@ -363,13 +742,17 @@ fn broaden_tool_args(tool: &str, args: &Value, attempt: usize) -> Value {
 
     let limit = obj.get("limit").and_then(|v| v.as_u64()).unwrap_or(20);
     let hours = obj.get("hours").and_then(|v| v.as_u64()).unwrap_or(24);
+    let has_fixed_window = obj.get("start_ts").and_then(|v| v.as_i64()).is_some()
+        && obj.get("end_ts").and_then(|v| v.as_i64()).is_some();
 
     match tool {
         "get_music_history" | "get_recent_activities" | "get_recent_ocr" | "get_recent_file_changes" => {
             let new_limit = std::cmp::min(limit + 20, 250);
-            let new_hours = std::cmp::min(hours * 2, 168);
             obj.insert("limit".to_string(), Value::Number(serde_json::Number::from(new_limit)));
-            obj.insert("hours".to_string(), Value::Number(serde_json::Number::from(new_hours)));
+            if !has_fixed_window {
+                let new_hours = std::cmp::min(hours * 2, 168);
+                obj.insert("hours".to_string(), Value::Number(serde_json::Number::from(new_hours)));
+            }
         }
         "search_ocr" => {
             let new_limit = std::cmp::min(limit + 20, 200);
@@ -412,6 +795,8 @@ fn execute_tool_with_retries(
 fn execute_parallel_search(
     db_path: &std::path::Path,
     args: &Value,
+    scope: Option<&TimeScope>,
+    user_query: &str,
 ) -> Result<(String, Vec<Value>), String> {
     let calls = args
         .get("calls")
@@ -431,7 +816,12 @@ fn execute_parallel_search(
         if tool == "parallel_search" {
             return Err("Nested parallel_search is not allowed".to_string());
         }
-        let tool_args = call.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+        let raw_tool_args = call.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+        let tool_args = if let Some(active_scope) = scope {
+            enforce_tool_args_with_scope(&tool, &raw_tool_args, active_scope, user_query)
+        } else {
+            raw_tool_args
+        };
         let db_path = db_path.to_path_buf();
 
         handles.push(std::thread::spawn(move || -> Result<(String, String, Vec<Value>, usize), String> {
@@ -470,21 +860,20 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
             let limit = args["limit"].as_u64().unwrap_or(100) as i32;
             let hours = args["hours"].as_u64().unwrap_or(24) as i64;
             let scan_limit = std::cmp::max(limit.saturating_mul(20), 500);
-            
-            let now = chrono::Utc::now().timestamp();
-            let lookback = now - (hours * 3600);
+            let (start_ts, end_ts) = resolve_window_from_args(args, hours);
+            let scope_label = args["scope_label"].as_str().unwrap_or("the selected time range");
             
             // Query a broad slice of recent activity and filter by media_info in Rust.
             // Music can be present while the active app is not an entertainment app.
             let mut stmt = conn.prepare(
                 "SELECT app_name, window_title, start_time, duration_seconds, metadata, category_id
                  FROM activities 
-                 WHERE start_time > ?1 AND metadata IS NOT NULL
+                 WHERE start_time >= ?1 AND start_time <= ?2 AND metadata IS NOT NULL
                  ORDER BY start_time DESC 
-                 LIMIT ?2"
+                 LIMIT ?3"
             ).map_err(|e| format!("SQL Error: {}", e))?;
             
-            let rows = stmt.query_map(rusqlite::params![lookback, scan_limit], |row| {
+            let rows = stmt.query_map(rusqlite::params![start_ts, end_ts, scan_limit], |row| {
                 let app_name: String = row.get(0)?;
                 let window_title: String = row.get(1)?;
                 let start_time: i64 = row.get(2)?;
@@ -594,7 +983,7 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
             let formatted = if results.is_empty() {
                 "No music activity found in the specified time range.".to_string()
             } else {
-                let mut f = format!("Here are the songs you've listened to in the last {} hours:\n\n", hours);
+                let mut f = format!("Here are the songs you've listened to in {}:\n\n", scope_label);
                 for (i, track) in results.iter().enumerate() {
                     let media = track.get("media_info").and_then(|m| m.as_object());
                     let app_raw = track.get("app_name").and_then(|a| a.as_str()).unwrap_or("");
@@ -641,22 +1030,23 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
             Ok((formatted, activity_refs))
         },
         "get_recent_activities" => {
-            let limit = args["limit"].as_u64().unwrap_or(40) as i32;
+            let limit = args["limit"].as_u64().unwrap_or(100) as i32;
             let hours = args["hours"].as_u64().unwrap_or(24) as i64;
             let category_filter = args["category_id"].as_i64();
-
-            let now = chrono::Utc::now().timestamp();
-            let lookback = now - (hours * 3600);
+            let exclude_media_noise = args["exclude_media_noise"].as_bool().unwrap_or(false);
+            let (start_ts, end_ts) = resolve_window_from_args(args, hours);
+            let scope_label = args["scope_label"].as_str().unwrap_or("the selected time range");
 
             let (sql, params): (&str, Vec<rusqlite::types::Value>) = if let Some(cat) = category_filter {
                 (
                     "SELECT app_name, window_title, start_time, duration_seconds, category_id, metadata
                      FROM activities
-                     WHERE start_time > ?1 AND category_id = ?2
+                     WHERE start_time >= ?1 AND start_time <= ?2 AND category_id = ?3
                      ORDER BY start_time DESC
-                     LIMIT ?3",
+                     LIMIT ?4",
                     vec![
-                        rusqlite::types::Value::Integer(lookback),
+                        rusqlite::types::Value::Integer(start_ts),
+                        rusqlite::types::Value::Integer(end_ts),
                         rusqlite::types::Value::Integer(cat),
                         rusqlite::types::Value::Integer(limit as i64),
                     ],
@@ -665,11 +1055,12 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
                 (
                     "SELECT app_name, window_title, start_time, duration_seconds, category_id, metadata
                      FROM activities
-                     WHERE start_time > ?1
+                     WHERE start_time >= ?1 AND start_time <= ?2
                      ORDER BY start_time DESC
-                     LIMIT ?2",
+                     LIMIT ?3",
                     vec![
-                        rusqlite::types::Value::Integer(lookback),
+                        rusqlite::types::Value::Integer(start_ts),
+                        rusqlite::types::Value::Integer(end_ts),
                         rusqlite::types::Value::Integer(limit as i64),
                     ],
                 )
@@ -693,7 +1084,10 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
                 }))
             }).map_err(|e| e.to_string())?;
 
-            let events: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
+            let mut events: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
+            if exclude_media_noise {
+                events.retain(|event| !is_media_noise_event(event));
+            }
             let activity_refs: Vec<Value> = events
                 .iter()
                 .map(|event| {
@@ -718,8 +1112,8 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
                 "No activity events found in the selected time range.".to_string()
             } else {
                 let mut out = format!(
-                    "Here are your recent activity events from the last {} hours:\n\n",
-                    hours
+                    "Here are your recent activity events from {}:\n\n",
+                    scope_label
                 );
                 for (i, event) in events.iter().enumerate() {
                     let app = event.get("app_name").and_then(|v| v.as_str()).unwrap_or("Unknown");
@@ -749,10 +1143,12 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
             let limit = args["limit"].as_u64().unwrap_or(40) as i64;
             let hours = args["hours"].as_u64().unwrap_or(24) as i64;
             let change_type = args["change_type"].as_str();
-            let lookback = chrono::Utc::now().timestamp() - (hours * 3600);
+            let (start_ts, end_ts) = resolve_window_from_args(args, hours);
+            let scope_label = args["scope_label"].as_str().unwrap_or("the selected time range");
             println!(
-                "[Timeline][FileChanges] Query start: hours={}, limit={}, change_type={}",
-                hours,
+                "[Timeline][FileChanges] Query start: start_ts={}, end_ts={}, limit={}, change_type={}",
+                start_ts,
+                end_ts,
                 limit,
                 change_type.unwrap_or("any")
             );
@@ -761,11 +1157,12 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
                 (
                     "SELECT path, project_root, entity_type, change_type, content_preview, detected_at
                      FROM code_file_events
-                     WHERE detected_at > ?1 AND change_type = ?2
+                     WHERE detected_at >= ?1 AND detected_at <= ?2 AND change_type = ?3
                      ORDER BY detected_at DESC
-                     LIMIT ?3",
+                     LIMIT ?4",
                     vec![
-                        rusqlite::types::Value::Integer(lookback),
+                        rusqlite::types::Value::Integer(start_ts),
+                        rusqlite::types::Value::Integer(end_ts),
                         rusqlite::types::Value::Text(kind.to_string()),
                         rusqlite::types::Value::Integer(limit),
                     ],
@@ -774,11 +1171,12 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
                 (
                     "SELECT path, project_root, entity_type, change_type, content_preview, detected_at
                      FROM code_file_events
-                     WHERE detected_at > ?1
+                     WHERE detected_at >= ?1 AND detected_at <= ?2
                      ORDER BY detected_at DESC
-                     LIMIT ?2",
+                     LIMIT ?3",
                     vec![
-                        rusqlite::types::Value::Integer(lookback),
+                        rusqlite::types::Value::Integer(start_ts),
+                        rusqlite::types::Value::Integer(end_ts),
                         rusqlite::types::Value::Integer(limit),
                     ],
                 )
@@ -800,9 +1198,10 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
 
             let changes: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
             println!(
-                "[Timeline][FileChanges] Retrieved {} rows (lookback_unix={})",
+                "[Timeline][FileChanges] Retrieved {} rows (start_ts={}, end_ts={})",
                 changes.len(),
-                lookback
+                start_ts,
+                end_ts
             );
             for item in &changes {
                 let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -825,7 +1224,7 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
             let formatted = if changes.is_empty() {
                 "No file changes found in the selected time range.".to_string()
             } else {
-                let mut out = format!("Recent file changes (last {} hours):\n\n", hours);
+                let mut out = format!("Recent file changes ({}):\n\n", scope_label);
                 for (idx, item) in changes.iter().enumerate() {
                     let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
                     let project_root = item.get("project_root").and_then(|v| v.as_str()).unwrap_or("");
@@ -897,23 +1296,24 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
         },
         "search_ocr" => {
             let keyword = args["keyword"].as_str().ok_or("Missing keyword")?;
-            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            let limit = args["limit"].as_u64().unwrap_or(100) as usize;
+            let hours = args["hours"].as_u64().unwrap_or(24) as i64;
+            let (start_ts, end_ts) = resolve_window_from_args(args, hours);
             
             // Search in metadata blobs (inefficient but works for now without FTS5)
             // Ideally we'd have a separate text table.
             let mut stmt = conn.prepare(
                 "SELECT start_time, app_name, window_title, duration_seconds, category_id, metadata FROM activities 
-                 WHERE start_time > ?1
-                 ORDER BY start_time DESC LIMIT 1000"
+                 WHERE start_time >= ?1 AND start_time <= ?2
+                 AND LOWER(CAST(metadata AS TEXT)) LIKE ?3
+                 ORDER BY start_time DESC LIMIT 20000"
             ).map_err(|e| e.to_string())?;
             
-            // Default lookback 24h
-            let now = chrono::Utc::now().timestamp();
-            let lookback = now - 86400; // 24h
-            
             let mut matches: Vec<Value> = Vec::new();
+            let mut seen_snippets = std::collections::HashSet::new();
+            let kw_param = format!("%{}%", keyword.to_lowercase());
             
-            let rows = stmt.query_map([lookback], |row| {
+            let rows = stmt.query_map(rusqlite::params![start_ts, end_ts, kw_param], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -935,6 +1335,10 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
                                 }
                                 if cleaned.to_lowercase().contains(&keyword.to_lowercase()) {
                                     let snippet = truncate_snippet(&cleaned, &keyword.to_lowercase());
+                                    let short = normalize_whitespace(&snippet.chars().take(500).collect::<String>());
+                                    if !seen_snippets.insert(short.clone()) {
+                                        continue;
+                                    }
                                     matches.push(serde_json::json!({
                                         "app_name": app_name,
                                         "window_title": window_title,
@@ -975,24 +1379,28 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
             Ok((formatted, matches))
         },
         "get_recent_ocr" => {
-            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            let limit = args["limit"].as_u64().unwrap_or(100) as usize;
             let hours = args["hours"].as_u64().unwrap_or(24) as i64;
             let app_filter = args["app"].as_str().map(|s| s.to_lowercase());
             let keyword = args["keyword"].as_str().map(|s| s.to_lowercase());
-
-            let now = chrono::Utc::now().timestamp();
-            let lookback = now - (hours * 3600);
-            let scan_limit = std::cmp::max((limit as i64) * 20, 1000);
+            let (start_ts, end_ts) = resolve_window_from_args(args, hours);
+            let scope_label = args["scope_label"].as_str().unwrap_or("the selected time range");
+            let scan_limit = std::cmp::max((limit as i64) * 50, 10000);
 
             let mut stmt = conn.prepare(
                 "SELECT start_time, app_name, window_title, duration_seconds, category_id, metadata
                  FROM activities
-                 WHERE start_time > ?1 AND metadata IS NOT NULL
+                 WHERE start_time >= ?1 AND start_time <= ?2 AND metadata IS NOT NULL
+                 AND (?4 IS NULL OR LOWER(app_name) LIKE ?4)
+                 AND (?5 IS NULL OR LOWER(CAST(metadata AS TEXT)) LIKE ?5)
                  ORDER BY start_time DESC
-                 LIMIT ?2"
+                 LIMIT ?3"
             ).map_err(|e| e.to_string())?;
 
-            let rows = stmt.query_map(rusqlite::params![lookback, scan_limit], |row| {
+            let app_param = app_filter.as_ref().map(|a| format!("%{}%", a));
+            let kw_param = keyword.as_ref().map(|k| format!("%{}%", k));
+
+            let rows = stmt.query_map(rusqlite::params![start_ts, end_ts, scan_limit, app_param, kw_param], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -1026,7 +1434,7 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
                                     }
                                 }
 
-                                let short = normalize_whitespace(&normalized_text.chars().take(220).collect::<String>());
+                                let short = normalize_whitespace(&normalized_text.chars().take(500).collect::<String>());
                                 if !seen_snippets.insert(short.clone()) {
                                     continue;
                                 }
@@ -1071,7 +1479,7 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
             let formatted = if results.is_empty() {
                 "No OCR snippets found in the selected time range.".to_string()
             } else {
-                let mut out = format!("Recent OCR snippets (last {} hours):\n\n", hours);
+                let mut out = format!("Recent OCR snippets ({}):\n\n", scope_label);
                 for (i, item) in results.iter().enumerate() {
                     let app = item.get("app_name").and_then(|v| v.as_str()).unwrap_or("Unknown");
                     let start_time = item.get("start_time").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -1216,8 +1624,6 @@ fn format_duration(total_seconds: i64) -> String {
 
 fn normalize_final_answer(answer: &str) -> String {
     answer
-        .replace("**", "")
-        .replace('•', "-")
         .replace("â€“", "-")
         .replace("â€”", "-")
         .trim()
@@ -1276,16 +1682,16 @@ fn truncate_for_token_limit(text: &str, limit_chars: usize) -> String {
 fn truncate_snippet(text: &str, keyword: &str) -> String {
     if let Some(idx) = text.to_lowercase().find(keyword) {
         // Safe char boundary calculation
-        let start_char_idx = text[..idx].chars().count().saturating_sub(50);
+        let start_char_idx = text[..idx].chars().count().saturating_sub(150);
         let start = text.char_indices().nth(start_char_idx).map(|(i, _)| i).unwrap_or(0);
         
         // Find end byte safely
-        let end_char_idx = start_char_idx + 100 + keyword.len(); // approximate
+        let end_char_idx = start_char_idx + 300 + keyword.len(); // approximate
         let end = text.char_indices().nth(end_char_idx).map(|(i, _)| i).unwrap_or(text.len());
 
         format!("...{}...", &text[start..end])
     } else {
-        text.chars().take(100).collect()
+        text.chars().take(300).collect()
     }
 }
 
@@ -1342,6 +1748,56 @@ fn looks_like_gibberish(text: &str) -> bool {
     symbol_ratio > 0.35 || alpha_ratio < 0.18 || (letters > 10.0 && vowel_ratio < 0.06) || digit_ratio > 0.7
 }
 
+async fn synthesize_answer_from_evidence(
+    app_handle: &tauri::AppHandle,
+    model: &str,
+    api_key: &str,
+    user_query: &str,
+    scope: &TimeScope,
+    steps: &[AgentStep],
+    activities: &[Value],
+) -> Result<String, String> {
+    let mut evidence_lines: Vec<String> = Vec::new();
+    for (i, step) in steps.iter().take(8).enumerate() {
+        evidence_lines.push(format!(
+            "{}. {} -> {}",
+            i + 1,
+            step.tool_name,
+            truncate_for_token_limit(&step.tool_result, 8000)
+        ));
+    }
+
+    let summary_prompt = format!(
+        "User query: {query}\nTime scope: {label} ({start} to {end})\nEvidence items: {count}\nTool evidence:\n{evidence}\n\nReturn a detailed, crisp, and highly specific final answer. Break down the activities chronologically or by major tasks. Mention specific window titles, exact times, and specific apps/websites visited. Do not just give a high-level summary of time spent. Provide a rich narrative of what the user was actually doing. Do not call tools. If evidence is weak, clearly state uncertainty.",
+        query = user_query,
+        label = scope.label,
+        start = format_time_scope_ts(scope.start_ts),
+        end = format_time_scope_ts(scope.end_ts),
+        count = activities.len(),
+        evidence = evidence_lines.join("\n\n"),
+    );
+
+    let mut out = String::new();
+    let on_token = |chunk: &str| {
+        let _ = app_handle.emit("chat://token", chunk);
+    };
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: "You are a precise assistant. Produce one final answer from provided evidence only. Provide specific details, window titles, and times. No tool JSON.".to_string(),
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: summary_prompt,
+        },
+    ];
+    call_llm_stream(model, api_key, &messages, &mut out, on_token).await?;
+    if matches!(try_parse_tool_call_response(&out), Some(AgentResponse::ToolCall { .. })) {
+        return Ok("I gathered evidence but could not produce a stable final summary. Please ask with a specific app/date and I’ll answer exactly.".to_string());
+    }
+    Ok(normalize_final_answer(&out))
+}
+
 // Streaming LLM Call
 async fn call_llm_stream<F>(
     model: &str, 
@@ -1351,7 +1807,10 @@ async fn call_llm_stream<F>(
     mut on_token: F
 ) -> Result<(), String> 
 where F: FnMut(&str) {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(StdDuration::from_secs(LLM_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("Failed to init HTTP client: {}", e))?;
     
     let request = ChatRequest {
         model: model.to_string(),

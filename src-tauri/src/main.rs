@@ -132,6 +132,8 @@ fn main() {
             // Dashboard commands
             commands::dashboard::get_dashboard_overview,
             commands::dashboard::refresh_dashboard_overview,
+            commands::dashboard::summarize_contact,
+            commands::dashboard::summarize_project,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

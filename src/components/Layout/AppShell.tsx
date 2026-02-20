@@ -3,7 +3,6 @@ import type { PageType } from '../../App';
 import {
     PanelLeft,
     Home,
-    Crown,
     Settings,
 } from 'lucide-react';
 import { Sidebar } from './Sidebar';
@@ -66,15 +65,6 @@ export function AppShell({
                         </p>
                     </div>
                 </div>
-
-                {/* Upgrade Button */}
-                <button
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-white text-xs font-semibold transition-all shadow-lg shadow-orange-500/25 hover:shadow-orange-500/40"
-                    id="upgrade-button"
-                >
-                    <Crown className="w-3.5 h-3.5" />
-                    Upgrade
-                </button>
 
                 {/* Spacer for drag region */}
                 <div className="flex-1" data-tauri-drag-region />
