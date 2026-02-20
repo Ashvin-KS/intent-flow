@@ -258,6 +258,12 @@ export function SettingsPanel() {
                                         ]}
                                     />
                                     <SettingToggle
+                                        label="Enable Startup on Boot"
+                                        description="Launch IntentFlow automatically when Windows starts"
+                                        value={localSettings.general.enable_startup}
+                                        onChange={(v) => update('general', 'enable_startup', v)}
+                                    />
+                                    <SettingToggle
                                         label="Minimize to Tray"
                                         description="Minimize to system tray instead of taskbar"
                                         value={localSettings.general.minimize_to_tray}

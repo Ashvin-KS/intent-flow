@@ -1,5 +1,5 @@
-// Prevents additional console window on Windows in release
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Prevents additional console window on Windows (silent launch).
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod commands;
 mod database;
@@ -22,7 +22,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            Some(vec!["--autostart"]),
         ))
         .setup(|app| {
             // Initialize database
@@ -51,11 +51,23 @@ fn main() {
             // Start daily dashboard engine (today-focused summaries)
             services::dashboard_engine::start_dashboard_engine(app_handle.clone());
 
-            // Enable startup on Windows and keep startup silent (tray-first behavior).
-            #[cfg(target_os = "windows")]
+            // Apply startup enable/disable on Windows from settings.
+            #[cfg(all(target_os = "windows", not(debug_assertions)))]
             {
                 let autostart = app_handle.autolaunch();
-                let _ = autostart.enable();
+                let startup_enabled = read_settings(&app_handle)
+                    .map(|s| s.general.enable_startup)
+                    .unwrap_or(true);
+                if startup_enabled {
+                    let _ = autostart.enable();
+                } else {
+                    let _ = autostart.disable();
+                }
+            }
+            #[cfg(all(target_os = "windows", debug_assertions))]
+            {
+                // Never keep autostart pointing to dev/debug binaries (they depend on localhost dev server).
+                let _ = app_handle.autolaunch().disable();
             }
 
             apply_startup_behavior(&app_handle);
@@ -206,11 +218,20 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn apply_startup_behavior(app_handle: &tauri::AppHandle) {
-    let Some(settings) = read_settings(app_handle) else { return };
-    let behavior = settings.general.startup_behavior.to_lowercase();
-    if behavior == "minimized_to_tray" || behavior == "hidden" {
+    let args: Vec<String> = std::env::args().collect();
+    let is_autostart = args.iter().any(|arg| arg == "--autostart");
+
+    let behavior = read_settings(app_handle)
+        .map(|s| s.general.startup_behavior.to_lowercase())
+        .unwrap_or_else(|| "normal".to_string());
+
+    if is_autostart && (behavior == "minimized_to_tray" || behavior == "hidden") {
+        // Keep it hidden (it's hidden by default in tauri.conf.json)
+    } else {
+        // Show the window for manual launch or if startup behavior is normal
         if let Some(window) = app_handle.get_webview_window("main") {
-            let _ = window.hide();
+            let _ = window.show();
+            let _ = window.set_focus();
         }
     }
 }

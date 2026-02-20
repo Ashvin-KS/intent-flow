@@ -1,6 +1,8 @@
 use tauri::{AppHandle, Manager};
 use crate::models::{Settings, Category};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "windows")]
+use tauri_plugin_autostart::ManagerExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
@@ -85,6 +87,16 @@ pub async fn update_settings(
     let content = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     
     std::fs::write(&config_path, content).map_err(|e| e.to_string())?;
+
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    {
+        let autostart = app_handle.autolaunch();
+        if settings.general.enable_startup {
+            let _ = autostart.enable();
+        } else {
+            let _ = autostart.disable();
+        }
+    }
 
     crate::services::activity_tracker::set_tracking_enabled(settings.tracking.enabled);
     crate::services::activity_tracker::set_tracking_interval(settings.tracking.tracking_interval);

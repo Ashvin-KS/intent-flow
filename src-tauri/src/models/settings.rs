@@ -29,6 +29,8 @@ impl Default for Settings {
 pub struct GeneralSettings {
     pub language: String,
     pub theme: String,
+    #[serde(default = "default_enable_startup")]
+    pub enable_startup: bool,
     pub startup_behavior: String,
     pub minimize_to_tray: bool,
     pub close_to_tray: bool,
@@ -39,11 +41,16 @@ impl Default for GeneralSettings {
         Self {
             language: "en".to_string(),
             theme: "dark".to_string(),
+            enable_startup: true,
             startup_behavior: "minimized_to_tray".to_string(),
             minimize_to_tray: true,
             close_to_tray: true,
         }
     }
+}
+
+fn default_enable_startup() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

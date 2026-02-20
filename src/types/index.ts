@@ -190,6 +190,7 @@ export interface Settings {
 export interface GeneralSettings {
   language: string;
   theme: 'light' | 'dark' | 'system';
+  enable_startup: boolean;
   startup_behavior: 'show_window' | 'minimized_to_tray' | 'hidden';
   minimize_to_tray: boolean;
   close_to_tray: boolean;
