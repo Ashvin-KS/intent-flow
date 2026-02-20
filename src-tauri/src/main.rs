@@ -7,10 +7,23 @@ mod models;
 mod services;
 mod utils;
 
-use tauri::Manager;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::{Emitter, Manager};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri_plugin_autostart::ManagerExt;
+
+static GAME_MODE_ENABLED: AtomicBool = AtomicBool::new(false);
+static INCOGNITO_ENABLED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
+    utils::config::load_dotenv();
+
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(|app| {
             // Initialize database
             let app_handle = app.handle();
@@ -28,11 +41,36 @@ fn main() {
             
             // Start screen capture + OCR service (every ~10s, non-blocking)
             services::screen_capture::start_screen_capture(app_handle.clone());
+
+            // Start code file monitor (for coding-context enrichment)
+            services::file_monitor::start_file_monitor(app_handle.clone());
             
             // Start pattern engine (background analysis)
             services::pattern_engine::start_pattern_engine(app_handle.clone());
+
+            // Start daily dashboard engine (today-focused summaries)
+            services::dashboard_engine::start_dashboard_engine(app_handle.clone());
+
+            // Enable startup on Windows and keep startup silent (tray-first behavior).
+            #[cfg(target_os = "windows")]
+            {
+                let autostart = app_handle.autolaunch();
+                let _ = autostart.enable();
+            }
+
+            apply_startup_behavior(&app_handle);
+            apply_monitoring_state(&app_handle);
+            setup_tray(app)?;
             
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if should_close_to_tray(window.app_handle()) {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             // Activity commands
@@ -77,7 +115,141 @@ fn main() {
             commands::chat::delete_chat_session,
             commands::chat::get_chat_messages,
             commands::chat::send_chat_message,
+            commands::chat::get_recent_models,
+            commands::chat::remove_recent_model,
+            // Dashboard commands
+            commands::dashboard::get_dashboard_overview,
+            commands::dashboard::refresh_dashboard_overview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let launch_item = MenuItem::with_id(app, "launch_app", "Launch App", true, None::<&str>)?;
+    let open_chat_item = MenuItem::with_id(app, "open_chat", "Open Chat", true, None::<&str>)?;
+    let game_mode_item = MenuItem::with_id(app, "toggle_game_mode", "Game Mode: OFF", true, None::<&str>)?;
+    let incognito_item = MenuItem::with_id(app, "toggle_incognito", "Incognito: OFF", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+
+    let menu = Menu::with_items(
+        app,
+        &[
+            &launch_item,
+            &open_chat_item,
+            &PredefinedMenuItem::separator(app)?,
+            &game_mode_item,
+            &incognito_item,
+            &PredefinedMenuItem::separator(app)?,
+            &quit_item,
+        ],
+    )?;
+
+    let game_mode_item_handle = game_mode_item.clone();
+    let incognito_item_handle = incognito_item.clone();
+
+    let mut tray_builder = TrayIconBuilder::new()
+        .menu(&menu)
+        .on_menu_event(move |app, event| {
+            let id = event.id().as_ref();
+            match id {
+                "launch_app" => {
+                    show_window_and_navigate(app, "home");
+                }
+                "open_chat" => {
+                    show_window_and_navigate(app, "chat");
+                }
+                "toggle_game_mode" => {
+                    let next = !GAME_MODE_ENABLED.load(Ordering::Relaxed);
+                    GAME_MODE_ENABLED.store(next, Ordering::Relaxed);
+                    let _ = game_mode_item_handle.set_text(if next {
+                        "Game Mode: ON"
+                    } else {
+                        "Game Mode: OFF"
+                    });
+                    apply_monitoring_state(app);
+                }
+                "toggle_incognito" => {
+                    let next = !INCOGNITO_ENABLED.load(Ordering::Relaxed);
+                    INCOGNITO_ENABLED.store(next, Ordering::Relaxed);
+                    let _ = incognito_item_handle.set_text(if next {
+                        "Incognito: ON"
+                    } else {
+                        "Incognito: OFF"
+                    });
+                    apply_monitoring_state(app);
+                }
+                "quit" => {
+                    app.exit(0);
+                }
+                _ => {}
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_window_and_navigate(tray.app_handle(), "home");
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon() {
+        tray_builder = tray_builder.icon(icon.clone());
+    }
+
+    tray_builder.build(app)?;
+
+    Ok(())
+}
+
+fn apply_startup_behavior(app_handle: &tauri::AppHandle) {
+    let Some(settings) = read_settings(app_handle) else { return };
+    let behavior = settings.general.startup_behavior.to_lowercase();
+    if behavior == "minimized_to_tray" || behavior == "hidden" {
+        if let Some(window) = app_handle.get_webview_window("main") {
+            let _ = window.hide();
+        }
+    }
+}
+
+fn apply_monitoring_state(app_handle: &tauri::AppHandle) {
+    let settings_enabled = read_settings(app_handle)
+        .map(|s| s.tracking.enabled)
+        .unwrap_or(true);
+    let effective_enabled = settings_enabled
+        && !GAME_MODE_ENABLED.load(Ordering::Relaxed)
+        && !INCOGNITO_ENABLED.load(Ordering::Relaxed);
+    services::activity_tracker::set_tracking_enabled(effective_enabled);
+    services::screen_capture::set_capture_enabled(effective_enabled);
+}
+
+fn show_window_and_navigate(app_handle: &tauri::AppHandle, page: &str) {
+    if let Some(window) = app_handle.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = window.emit("tray:navigate", page.to_string());
+    }
+}
+
+fn should_close_to_tray(app_handle: &tauri::AppHandle) -> bool {
+    read_settings(app_handle)
+        .map(|s| s.general.close_to_tray)
+        .unwrap_or(true)
+}
+
+fn read_settings(app_handle: &tauri::AppHandle) -> Option<models::Settings> {
+    let data_dir = app_handle.path().app_data_dir().ok()?;
+    let config_path = data_dir.join("config").join("settings.json");
+    if !config_path.exists() {
+        let mut settings = models::Settings::default();
+        utils::config::apply_env_defaults(&mut settings);
+        return Some(settings);
+    }
+    let content = std::fs::read_to_string(config_path).ok()?;
+    let mut settings = serde_json::from_str::<models::Settings>(&content).ok()?;
+    utils::config::apply_env_defaults(&mut settings);
+    Some(settings)
 }

@@ -100,10 +100,11 @@ pub struct AISettings {
 
 impl Default for AISettings {
     fn default() -> Self {
+        let env_key = std::env::var("NVIDIA_API_KEY").unwrap_or_default();
         Self {
             enabled: true,
             provider: "nvidia".to_string(),
-            api_key: "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".to_string(),
+            api_key: env_key,
             model: "moonshotai/kimi-k2-instruct-0905".to_string(),
             local_only: false,
             fallback_to_local: true,

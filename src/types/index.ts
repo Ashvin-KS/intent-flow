@@ -279,3 +279,33 @@ export interface ChatMessage {
   activities?: ActivityRef[];
   created_at: number;
 }
+
+// Dashboard types
+export interface DashboardTask {
+  title: string;
+  due_date?: string;
+  status: string;
+  source: string;
+}
+
+export interface ProjectOverview {
+  name: string;
+  update: string;
+  files_changed: number;
+}
+
+export interface ContactOverview {
+  name: string;
+  context: string;
+  last_seen?: number;
+}
+
+export interface DashboardOverview {
+  date_key: string;
+  summary: string;
+  focus_points: string[];
+  deadlines: DashboardTask[];
+  projects: ProjectOverview[];
+  contacts: ContactOverview[];
+  updated_at: number;
+}

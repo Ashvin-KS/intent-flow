@@ -50,6 +50,16 @@ interface ChatPageProps {
     initialPrompt?: string;
 }
 
+const CHAT_MODEL_STORAGE_KEY = 'intentflow_chat_selected_model';
+
+function loadSelectedModelFromStorage(): string {
+    try {
+        return localStorage.getItem(CHAT_MODEL_STORAGE_KEY) || '';
+    } catch {
+        return '';
+    }
+}
+
 export function ChatPage({ initialPrompt }: ChatPageProps) {
     const [sessions, setSessions] = useState<ChatSession[]>([]);
     const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -70,10 +80,10 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
         SOURCE_OPTIONS.filter((s) => s.default).map((s) => s.id)
     );
     const [selectedTimeRange, setSelectedTimeRange] = useState('today');
-    const [selectedModel, setSelectedModel] = useState<string>('');
+    const [selectedModel, setSelectedModel] = useState<string>(loadSelectedModelFromStorage);
 
     // Hooks
-    const { favorites } = useFavoriteModels();
+    const { favorites, addFavorite } = useFavoriteModels();
     const { settings } = useSettings();
 
     // Refs for dropdowns
@@ -81,12 +91,25 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
     const sourcesRef = useRef<HTMLDivElement>(null);
     const timeRef = useRef<HTMLDivElement>(null);
 
-    // Set default model from settings
+    // Sync selected model with Settings model updates only if user has no explicit chat selection.
     useEffect(() => {
-        if (settings?.ai.model && !selectedModel) {
+        if (!settings?.ai.model) return;
+        if (!selectedModel) {
             setSelectedModel(settings.ai.model);
         }
-    }, [settings]);
+    }, [settings?.ai.model, selectedModel]);
+
+    useEffect(() => {
+        try {
+            if (selectedModel) {
+                localStorage.setItem(CHAT_MODEL_STORAGE_KEY, selectedModel);
+            } else {
+                localStorage.removeItem(CHAT_MODEL_STORAGE_KEY);
+            }
+        } catch {
+            // ignore storage errors
+        }
+    }, [selectedModel]);
 
     // Close dropdowns on outside click
     useEffect(() => {
@@ -225,7 +248,11 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
         setMessages((prev) => [...prev, tempUserMsg]);
 
         try {
-            const response = await sendChatMessage(sessionId, messageText.trim());
+            const response = await sendChatMessage(sessionId, messageText.trim(), selectedModel || undefined);
+            if (selectedModel) {
+                const selected = favorites.find((f) => f.id === selectedModel);
+                addFavorite({ id: selectedModel, name: selected?.name || selectedModel });
+            }
             setMessages((prev) => [...prev, response]);
             loadSessions(); // Refresh sessions to update titles
         } catch (error) {
@@ -263,13 +290,27 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
 
     const renderStreamingMessage = () => {
         if (!streamingContent) return null;
-        if (streamingContent.trim().startsWith('{')) {
+        const looksLikeToolJson =
+            streamingContent.trim().startsWith('{') ||
+            (streamingContent.includes('"tool"') && streamingContent.includes('"args"'));
+        if (looksLikeToolJson) {
+            const toolNameMatch = streamingContent.match(/"tool"\s*:\s*"([^"]+)"/);
+            const reasoningMatch = streamingContent.match(/"reasoning"\s*:\s*"([\s\S]*?)"/);
+            const toolName = toolNameMatch?.[1] || 'tool';
+            const reasoningText = reasoningMatch?.[1]
+                ?.replace(/\\"/g, '"')
+                ?.replace(/\\n/g, '\n')
+                ?.trim();
             return (
                 <div className="flex justify-start mb-4 animate-pulse">
                     <div className="max-w-[85%] bg-dark-800 rounded-2xl rounded-bl-md px-4 py-3 border border-dark-700">
-                        <div className="flex items-center gap-2 text-primary-400">
+                        <div className="flex items-center gap-2 text-primary-400 mb-2">
                             <Bot className="w-4 h-4" />
-                            <span className="text-sm font-medium">Thinking...</span>
+                            <span className="text-sm font-medium">Thinking</span>
+                        </div>
+                        <div className="text-xs text-dark-300 space-y-1">
+                            {reasoningText && <p className="whitespace-pre-wrap">{reasoningText}</p>}
+                            <p className="text-dark-400">Running `{toolName}`...</p>
                         </div>
                     </div>
                 </div>
@@ -282,7 +323,7 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
             content: streamingContent,
             created_at: Date.now() / 1000,
         };
-        return <ChatMessage message={tempMsg} />;
+        return <ChatMessage message={tempMsg} isStreaming={true} />;
     };
 
     const getModelDisplayName = () => {
@@ -339,18 +380,18 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
                     {showModelDropdown && (
                         <div className="absolute bottom-full mb-2 left-0 w-64 bg-dark-800 border border-dark-700 rounded-xl shadow-2xl shadow-black/40 z-50 py-1 max-h-64 overflow-y-auto">
                             <div className="px-3 py-2 border-b border-dark-700/50">
-                                <p className="text-[10px] font-semibold text-dark-400 uppercase tracking-wider">Favorite Models</p>
+                                <p className="text-[10px] font-semibold text-dark-400 uppercase tracking-wider">Recent Models</p>
                             </div>
                             {favorites.length === 0 ? (
                                 <div className="px-3 py-4 text-center">
-                                    <p className="text-xs text-dark-500">No favorite models</p>
-                                    <p className="text-[10px] text-dark-600 mt-1">Add favorites in Settings → AI</p>
+                                    <p className="text-xs text-dark-500">No recent models</p>
+                                    <p className="text-[10px] text-dark-600 mt-1">Select a model in Settings or send a chat to populate recents</p>
                                 </div>
                             ) : (
                                 favorites.map((model) => (
                                     <button
                                         key={model.id}
-                                        onClick={() => { setSelectedModel(model.id); setShowModelDropdown(false); }}
+                                        onClick={() => { setSelectedModel(model.id); addFavorite({ id: model.id, name: model.name }); setShowModelDropdown(false); }}
                                         className={`w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-dark-700/50 transition-colors ${selectedModel === model.id ? 'text-blue-400' : 'text-dark-200'
                                             }`}
                                     >
@@ -624,3 +665,5 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
         </div>
     );
 }
+
+

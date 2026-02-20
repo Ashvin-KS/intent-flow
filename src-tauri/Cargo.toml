@@ -34,6 +34,8 @@ active-win-pos-rs = "0.8"
 open = "5"
 image = "0.25"
 xcap = "0.0.14"
+dotenvy = "0.15"
+walkdir = "2.5"
 windows = { version = "0.58", features = [
     "Media_Ocr",
     "Media_Control",

@@ -42,9 +42,11 @@ struct QueryChatRecvMessage {
 
 fn load_settings(app_handle: &AppHandle) -> Option<Settings> {
     let data_dir = app_handle.path().app_data_dir().ok()?;
-    let settings_path = data_dir.join("settings.json");
+    let settings_path = data_dir.join("config").join("settings.json");
     let data = std::fs::read_to_string(settings_path).ok()?;
-    serde_json::from_str(&data).ok()
+    let mut settings: Settings = serde_json::from_str(&data).ok()?;
+    crate::utils::config::apply_env_defaults(&mut settings);
+    Some(settings)
 }
 
 // ─── AI System Prompt ───
@@ -465,17 +467,18 @@ pub async fn execute_query(
     
     // AI gets ALL data — it decides what's relevant based on the query
     let settings = load_settings(&app_handle).unwrap_or_default();
+    let resolved_api_key = crate::utils::config::resolve_api_key(&settings.ai.api_key);
     let category_filter = extract_category_filter(&query);
     
     // Default to Agentic Search if AI is enabled
-    let adjusted_summary = if settings.ai.enabled && !settings.ai.api_key.is_empty() {
+    let adjusted_summary = if settings.ai.enabled && !resolved_api_key.is_empty() {
         // Use the new Agentic Engine
         match crate::services::query_engine::run_agentic_search(&app_handle, &query, &settings).await {
              Ok(answer) => answer,
              Err(e) => {
                  eprintln!("Agentic search failed: {}", e);
                  // Fallback to old linear summary if agent fails
-                  match ai_summarize_query(&query, &structured_data, &settings.ai.api_key, &settings.ai.model).await {
+                  match ai_summarize_query(&query, &structured_data, &resolved_api_key, &settings.ai.model).await {
                         Ok(linear) => format!("[Agent failed, used linear fallback] {}", linear),
                         Err(_e2) => format!("[AI Error: {}] {}", e, build_fallback_summary(&time_label, &app_filter, &category_filter, &all_activities, total_duration))
                   }
@@ -1036,3 +1039,5 @@ fn format_duration(seconds: i32) -> String {
         format!("{}m", minutes)
     }
 }
+
+

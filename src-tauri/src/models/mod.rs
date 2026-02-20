@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod category;
+pub mod dashboard;
 pub mod entry;
 pub mod intent;
 pub mod pattern;
@@ -10,6 +11,7 @@ pub mod workflow;
 
 pub use activity::*;
 pub use category::*;
+pub use dashboard::*;
 pub use entry::*;
 pub use intent::*;
 pub use query::*;

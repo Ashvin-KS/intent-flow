@@ -1,3 +1,4 @@
+pub mod config;
 pub mod windows;
 
 use std::hash::Hasher;

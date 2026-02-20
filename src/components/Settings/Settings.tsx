@@ -29,7 +29,7 @@ type SettingsTab = 'general' | 'tracking' | 'storage' | 'ai' | 'privacy' | 'noti
 
 export function SettingsPanel() {
     const { settings, isLoading, isSaving, error, updateSettings } = useSettings();
-    const { favorites, addFavorite, removeFavorite, isFavorite } = useFavoriteModels();
+    const { favorites, removeFavorite } = useFavoriteModels();
     const [activeTab, setActiveTab] = useState<SettingsTab>('general');
     const [localSettings, setLocalSettings] = useState<SettingsType | null>(null);
     const [storageStats, setStorageStats] = useState<StorageStats | null>(null);
@@ -505,17 +505,17 @@ export function SettingsPanel() {
                                         onChange={(v) => update('ai', 'fallback_to_local', v)}
                                     />
 
-                                    {/* Favorite Models */}
+                                    {/* Recent Models */}
                                     <div className="border-t border-dark-700/50 pt-5">
                                         <div className="flex items-center justify-between mb-3">
                                             <div>
-                                                <label className="block text-sm font-medium text-white">Favorite Models</label>
-                                                <p className="text-xs text-dark-400 mt-0.5">Pick up to 5 models for quick access in Chat</p>
+                                                <label className="block text-sm font-medium text-white">Recent Models</label>
+                                                <p className="text-xs text-dark-400 mt-0.5">Last 5 models used in Chat (auto-updated)</p>
                                             </div>
                                             <span className="text-xs text-dark-500">{favorites.length}/5</span>
                                         </div>
 
-                                        {/* Current favorites */}
+                                        {/* Current recent models */}
                                         {favorites.length > 0 && (
                                             <div className="space-y-1.5 mb-3">
                                                 {favorites.map((fav) => (
@@ -525,7 +525,7 @@ export function SettingsPanel() {
                                                         <button
                                                             onClick={() => removeFavorite(fav.id)}
                                                             className="text-dark-500 hover:text-red-400 transition-colors flex-shrink-0"
-                                                            title="Remove from favorites"
+                                                            title="Remove from recent list"
                                                         >
                                                             <X className="w-3.5 h-3.5" />
                                                         </button>
@@ -534,28 +534,8 @@ export function SettingsPanel() {
                                             </div>
                                         )}
 
-                                        {/* Add from available models */}
-                                        {availableModels.length > 0 && favorites.length < 5 && (
-                                            <div className="max-h-40 overflow-y-auto border border-dark-700/50 rounded-lg">
-                                                {availableModels
-                                                    .filter((m) => !isFavorite(m.id))
-                                                    .slice(0, 20)
-                                                    .map((model) => (
-                                                        <button
-                                                            key={model.id}
-                                                            onClick={() => addFavorite({ id: model.id, name: model.name })}
-                                                            className="w-full flex items-center gap-2 px-3 py-2 text-left text-xs hover:bg-dark-800/60 transition-colors text-dark-300 hover:text-white"
-                                                        >
-                                                            <Star className="w-3 h-3 text-dark-600 flex-shrink-0" />
-                                                            <span className="truncate">{model.name}</span>
-                                                        </button>
-                                                    ))
-                                                }
-                                            </div>
-                                        )}
-
-                                        {availableModels.length === 0 && favorites.length < 5 && (
-                                            <p className="text-xs text-dark-500 italic">Enter an API key and refresh models to add favorites</p>
+                                        {favorites.length === 0 && (
+                                            <p className="text-xs text-dark-500 italic">Use a model in Chat to populate this list</p>
                                         )}
                                     </div>
                                 </div>
@@ -750,3 +730,4 @@ function SettingText({
         </div>
     );
 }
+

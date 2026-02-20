@@ -18,7 +18,7 @@ const navItems: { id: PageType; label: string; icon: typeof Home }[] = [
     { id: 'home', label: 'Home', icon: Home },
     { id: 'chat', label: 'Chat', icon: MessageCircle },
     { id: 'timeline', label: 'Timeline', icon: History },
-    { id: 'workflows', label: 'Workflows', icon: Zap },
+    { id: 'workflows', label: 'Dashboard', icon: Zap },
 ];
 
 export function Sidebar({ isOpen, activePage, onNavigate, onClose }: SidebarProps) {

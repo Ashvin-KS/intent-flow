@@ -61,9 +61,13 @@ pub async fn get_settings(
     
     if config_path.exists() {
         let content = std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&content).map_err(|e| e.to_string())
+        let mut settings: Settings = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+        crate::utils::config::apply_env_defaults(&mut settings);
+        Ok(settings)
     } else {
-        Ok(Settings::default())
+        let mut settings = Settings::default();
+        crate::utils::config::apply_env_defaults(&mut settings);
+        Ok(settings)
     }
 }
 
@@ -84,6 +88,22 @@ pub async fn update_settings(
 
     crate::services::activity_tracker::set_tracking_enabled(settings.tracking.enabled);
     crate::services::activity_tracker::set_tracking_interval(settings.tracking.tracking_interval);
+
+    // Keep selected settings model visible in "recent models" so Chat can use it immediately.
+    let model_id = settings.ai.model.trim();
+    if !model_id.is_empty() {
+        let db_path = data_dir.join("intentflow.db");
+        let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+        let now = chrono::Utc::now().timestamp();
+        let _ = conn.execute(
+            "INSERT INTO ai_model_usage (model_id, model_name, use_count, last_used)
+             VALUES (?1, ?2, 0, ?3)
+             ON CONFLICT(model_id) DO UPDATE SET
+                model_name = excluded.model_name,
+                last_used = excluded.last_used",
+            rusqlite::params![model_id, model_id, now],
+        );
+    }
     
     Ok(())
 }

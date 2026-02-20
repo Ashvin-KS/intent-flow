@@ -210,9 +210,71 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // AI model usage (recently used models)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS ai_model_usage (
+            model_id TEXT PRIMARY KEY,
+            model_name TEXT NOT NULL,
+            use_count INTEGER NOT NULL DEFAULT 0,
+            last_used INTEGER NOT NULL
+        )",
+        [],
+    )?;
+
+    // Code file change events captured from monitored project roots.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS code_file_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL,
+            project_root TEXT NOT NULL,
+            entity_type TEXT NOT NULL DEFAULT 'file',
+            change_type TEXT NOT NULL,
+            content_preview TEXT,
+            detected_at INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    ensure_column_exists(
+        conn,
+        "code_file_events",
+        "entity_type",
+        "TEXT NOT NULL DEFAULT 'file'",
+    )?;
+    ensure_column_exists(conn, "code_file_events", "content_preview", "TEXT")?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_code_file_events_detected_at ON code_file_events(detected_at)",
+        [],
+    )?;
+
+    // Daily dashboard snapshot generated from current-day context.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dashboard_snapshots (
+            date_key TEXT PRIMARY KEY,
+            summary_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+        [],
+    )?;
+
     // Insert default categories if they don't exist
     insert_default_categories(conn)?;
 
+    Ok(())
+}
+
+fn ensure_column_exists(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if columns.iter().any(|c| c == column) {
+        return Ok(());
+    }
+    conn.execute(
+        &format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, definition),
+        [],
+    )?;
     Ok(())
 }
 

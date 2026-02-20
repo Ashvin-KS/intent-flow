@@ -59,6 +59,8 @@ struct ChatStreamChoice {
 #[derive(Deserialize)]
 struct ChatStreamDelta {
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 // ─── Agent Logic ───
@@ -90,7 +92,11 @@ You have access to the user's activity history (apps, windows, duration, time) a
    - Args: hours (default 24), limit (default 20), app (optional), keyword (optional)
    - Returns recent OCR snippets with app and timestamp
 
-7. `parallel_search` - Run multiple tool calls in parallel for broader coverage
+7. `get_recent_file_changes` - Recent code/document file changes from monitored project roots
+   - Args: hours (default 24), limit (default 40), change_type (optional: created|modified|deleted)
+   - Returns recent file change events with project root and timestamp
+
+8. `parallel_search` - Run multiple tool calls in parallel for broader coverage
    - Args: calls = [{tool: "...", args: {...}}, ...]
    - Use for complex queries that need combining activity + OCR + music evidence quickly
 
@@ -105,14 +111,22 @@ You have access to the user's activity history (apps, windows, duration, time) a
 5. For "show OCR data" queries → Use get_recent_ocr without keyword
 6. NEVER give up after one query if results are empty - try different approaches
 7. If a tool returns empty results, try a broader query or different keywords
-8. For broad/ambiguous requests, prefer parallel_search with 2-3 tool calls
-9. Use conversation history to resolve references like "it", "that", "the previous one", "what was it about".
+8. For coding progress or project-change questions, use get_recent_file_changes.
+9. For broad/ambiguous requests, prefer parallel_search with 2-3 tool calls
+10. Use conversation history to resolve references like "it", "that", "the previous one", "what was it about".
 
 ## Response Format
 Output JSON for tool calls: { "tool": "tool_name", "args": { ... }, "reasoning": "..." }
 Output plain text for final answers (no JSON, no markdown, no **bold** markers).
 
 Do NOT output markdown code blocks for tool calls. Output RAW JSON only.
+
+## Thinking Quality Rules
+- If reasoning content is emitted, keep it user-facing and concise (max 1 short sentence).
+- Never include internal planning language such as "the user is asking", "I should", "let me", "likely", or tool-selection analysis.
+- Never echo raw tool-call JSON inside thinking text.
+- Bad example: "The user says now? Likely they want..."
+- Good example: "Checking your recent music activity now."
 "#;
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -172,7 +186,7 @@ pub async fn run_agentic_search_with_steps_and_history(
     settings: &Settings,
     prior_messages: &[ChatMessage],
 ) -> Result<AgentResult, String> {
-    let api_key = &settings.ai.api_key;
+    let api_key = crate::utils::config::resolve_api_key(&settings.ai.api_key);
     let model = &settings.ai.model;
     
     if api_key.is_empty() {
@@ -216,36 +230,29 @@ pub async fn run_agentic_search_with_steps_and_history(
         // 1. Call LLM with streaming callback
         // We accumulate the full content here, while also streaming it to the frontend
         let mut full_response = String::new();
+        let mut decision_made = false;
+        let mut suppress_stream = false;
+        let mut sniff = String::new();
         // Callback to handle streaming chunks
         let on_token = |chunk: &str| {
-            // Simple heuristic: if it starts with {, it's likely a tool call (don't stream text/answer)
-            // But we can't know for sure until we have enough chars.
-            // For now, let's just stream everything. The frontend can decide to show/hide based on logic or user preference.
-            // Actually, better: if it's the final answer (not JSON), we stream.
-            // If it's a tool call (JSON), we might want to suppress it or show "Thinking..."
-            
-            // Send event to frontend
-            let _ = app_handle.emit("chat://token", chunk);
+            sniff.push_str(chunk);
+            if !decision_made && sniff.trim_start().len() >= 6 {
+                decision_made = true;
+            }
+            if sniff.contains("\"tool\"") && sniff.contains("\"args\"") {
+                suppress_stream = true;
+            }
+
+            if !suppress_stream {
+                let _ = app_handle.emit("chat://token", chunk);
+            }
         };
 
-        call_llm_stream(model, api_key, &messages, &mut full_response, on_token).await?;
+        call_llm_stream(model, &api_key, &messages, &mut full_response, on_token).await?;
 
         // 2. Parse Response
-        // Try to parse as ToolCall JSON first
-        let parsed_response = if full_response.trim().starts_with('{') {
-             match serde_json::from_str::<AgentResponse>(&full_response) {
-                Ok(resp) => resp,
-                Err(_) => {
-                    // Maybe it was just a string starting with {? Unlikely for tool calls.
-                    // Or malformed JSON.
-                    // Fallback to treating as FinalAnswer
-                    AgentResponse::FinalAnswer(full_response.clone())
-                }
-             }
-        } else {
-            // Plain text
-            AgentResponse::FinalAnswer(full_response.clone())
-        };
+        let parsed_response = try_parse_tool_call_response(&full_response)
+            .unwrap_or_else(|| AgentResponse::FinalAnswer(full_response.clone()));
 
         // 3. Handle Action
         match parsed_response {
@@ -340,6 +347,7 @@ fn is_low_signal_result(tool: &str, output: &str, activities: &[Value]) -> bool 
     match tool {
         "get_music_history" => text.contains("no music activity found"),
         "get_recent_activities" => text.contains("no activity events found"),
+        "get_recent_file_changes" => text.contains("no file changes found"),
         "search_ocr" | "get_recent_ocr" => text.contains("no ocr") || text.contains("no matches"),
         "query_activities" => text.contains("[]") || text.contains("no rows"),
         _ => false,
@@ -357,7 +365,7 @@ fn broaden_tool_args(tool: &str, args: &Value, attempt: usize) -> Value {
     let hours = obj.get("hours").and_then(|v| v.as_u64()).unwrap_or(24);
 
     match tool {
-        "get_music_history" | "get_recent_activities" | "get_recent_ocr" => {
+        "get_music_history" | "get_recent_activities" | "get_recent_ocr" | "get_recent_file_changes" => {
             let new_limit = std::cmp::min(limit + 20, 250);
             let new_hours = std::cmp::min(hours * 2, 168);
             obj.insert("limit".to_string(), Value::Number(serde_json::Number::from(new_limit)));
@@ -737,6 +745,115 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
 
             Ok((formatted, activity_refs))
         },
+        "get_recent_file_changes" => {
+            let limit = args["limit"].as_u64().unwrap_or(40) as i64;
+            let hours = args["hours"].as_u64().unwrap_or(24) as i64;
+            let change_type = args["change_type"].as_str();
+            let lookback = chrono::Utc::now().timestamp() - (hours * 3600);
+            println!(
+                "[Timeline][FileChanges] Query start: hours={}, limit={}, change_type={}",
+                hours,
+                limit,
+                change_type.unwrap_or("any")
+            );
+
+            let (sql, params): (&str, Vec<rusqlite::types::Value>) = if let Some(kind) = change_type {
+                (
+                    "SELECT path, project_root, entity_type, change_type, content_preview, detected_at
+                     FROM code_file_events
+                     WHERE detected_at > ?1 AND change_type = ?2
+                     ORDER BY detected_at DESC
+                     LIMIT ?3",
+                    vec![
+                        rusqlite::types::Value::Integer(lookback),
+                        rusqlite::types::Value::Text(kind.to_string()),
+                        rusqlite::types::Value::Integer(limit),
+                    ],
+                )
+            } else {
+                (
+                    "SELECT path, project_root, entity_type, change_type, content_preview, detected_at
+                     FROM code_file_events
+                     WHERE detected_at > ?1
+                     ORDER BY detected_at DESC
+                     LIMIT ?2",
+                    vec![
+                        rusqlite::types::Value::Integer(lookback),
+                        rusqlite::types::Value::Integer(limit),
+                    ],
+                )
+            };
+
+            let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                    Ok(serde_json::json!({
+                        "path": row.get::<_, String>(0)?,
+                        "project_root": row.get::<_, String>(1)?,
+                        "entity_type": row.get::<_, String>(2)?,
+                        "change_type": row.get::<_, String>(3)?,
+                        "content_preview": row.get::<_, Option<String>>(4)?,
+                        "detected_at": row.get::<_, i64>(5)?,
+                    }))
+                })
+                .map_err(|e| e.to_string())?;
+
+            let changes: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
+            println!(
+                "[Timeline][FileChanges] Retrieved {} rows (lookback_unix={})",
+                changes.len(),
+                lookback
+            );
+            for item in &changes {
+                let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let change = item.get("change_type").and_then(|v| v.as_str()).unwrap_or("");
+                let entity_type = item.get("entity_type").and_then(|v| v.as_str()).unwrap_or("file");
+                let preview = item.get("content_preview").and_then(|v| v.as_str());
+                let detected = item.get("detected_at").and_then(|v| v.as_i64()).unwrap_or(0);
+                let dt = chrono::DateTime::from_timestamp(detected, 0)
+                    .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %I:%M:%S %p").to_string())
+                    .unwrap_or_else(|| "Unknown time".to_string());
+                println!(
+                    "[Timeline][FileChanges] {} | {} {} | {}{}",
+                    dt,
+                    entity_type,
+                    change,
+                    path,
+                    preview.map(|p| format!(" | {}", p.replace('\n', " "))).unwrap_or_default()
+                );
+            }
+            let formatted = if changes.is_empty() {
+                "No file changes found in the selected time range.".to_string()
+            } else {
+                let mut out = format!("Recent file changes (last {} hours):\n\n", hours);
+                for (idx, item) in changes.iter().enumerate() {
+                    let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    let project_root = item.get("project_root").and_then(|v| v.as_str()).unwrap_or("");
+                    let entity_type = item.get("entity_type").and_then(|v| v.as_str()).unwrap_or("file");
+                    let change = item.get("change_type").and_then(|v| v.as_str()).unwrap_or("");
+                    let preview = item.get("content_preview").and_then(|v| v.as_str()).unwrap_or("");
+                    let detected = item.get("detected_at").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let dt = chrono::DateTime::from_timestamp(detected, 0)
+                        .map(|dt| dt.with_timezone(&chrono::Local).format("%I:%M %p").to_string())
+                        .unwrap_or_else(|| "Unknown time".to_string());
+                    out.push_str(&format!(
+                        "{}. [{} {}] {} ({})\n   {}\n",
+                        idx + 1,
+                        entity_type,
+                        change,
+                        path,
+                        dt,
+                        project_root
+                    ));
+                    if !preview.is_empty() {
+                        out.push_str(&format!("   Change: {}\n", preview.replace('\n', " ")));
+                    }
+                }
+                out
+            };
+
+            Ok((formatted, changes))
+        }
         "query_activities" => {
             let sql = args["query"].as_str().or_else(|| args["sql"].as_str())
                 .ok_or("Missing 'query' argument")?;
@@ -1030,6 +1147,37 @@ fn transform_activities_for_frontend(tool: &str, tool_activities: &[Value]) -> V
         return tool_activities.to_vec();
     }
 
+    if tool == "get_recent_file_changes" {
+        return tool_activities
+            .iter()
+            .map(|item| {
+                let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let entity_type = item.get("entity_type").and_then(|v| v.as_str()).unwrap_or("file");
+                let change_type = item.get("change_type").and_then(|v| v.as_str()).unwrap_or("changed");
+                let content_preview = item.get("content_preview").and_then(|v| v.as_str()).unwrap_or("");
+                let title = if content_preview.is_empty() {
+                    format!("[{} {}] {}", entity_type, change_type, path)
+                } else {
+                    format!(
+                        "[{} {}] {} | {}",
+                        entity_type,
+                        change_type,
+                        path,
+                        content_preview.replace('\n', " ")
+                    )
+                };
+                serde_json::json!({
+                    "app": "File Monitor",
+                    "title": title,
+                    "time": item.get("detected_at").and_then(|v| v.as_i64()).unwrap_or(0),
+                    "duration_seconds": 0,
+                    "category": "Development",
+                    "media": Value::Null
+                })
+            })
+            .collect();
+    }
+
     if tool == "query_activities" || tool == "search_ocr" {
         let mut transformed = Vec::new();
         for act in tool_activities {
@@ -1074,6 +1222,34 @@ fn normalize_final_answer(answer: &str) -> String {
         .replace("â€”", "-")
         .trim()
         .to_string()
+}
+
+fn try_parse_tool_call_response(full_response: &str) -> Option<AgentResponse> {
+    let trimmed = full_response.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(resp) = serde_json::from_str::<AgentResponse>(trimmed) {
+        if matches!(resp, AgentResponse::ToolCall { .. }) {
+            return Some(resp);
+        }
+    }
+
+    if trimmed.contains("\"tool\"") && trimmed.contains("\"args\"") {
+        let start = trimmed.find('{')?;
+        let end = trimmed.rfind('}')?;
+        if end > start {
+            let candidate = &trimmed[start..=end];
+            if let Ok(resp) = serde_json::from_str::<AgentResponse>(candidate) {
+                if matches!(resp, AgentResponse::ToolCall { .. }) {
+                    return Some(resp);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn parse_iso_to_unix(iso: &str) -> Option<i64> {
@@ -1203,6 +1379,7 @@ where F: FnMut(&str) {
 
     // Process stream line by line
     let mut buffer = String::new();
+    let mut reasoning_open = false;
     while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
         let chunk_str = String::from_utf8_lossy(&chunk);
         buffer.push_str(&chunk_str);
@@ -1225,7 +1402,23 @@ where F: FnMut(&str) {
                 
                 if let Ok(stream_resp) = serde_json::from_str::<ChatStreamResponse>(data) {
                     if let Some(choice) = stream_resp.choices.first() {
+                        if let Some(ref reasoning) = choice.delta.reasoning_content {
+                            if !reasoning.is_empty() {
+                                if !reasoning_open {
+                                    output_buffer.push_str("<think>");
+                                    on_token("<think>");
+                                    reasoning_open = true;
+                                }
+                                output_buffer.push_str(reasoning);
+                                on_token(reasoning);
+                            }
+                        }
                         if let Some(ref content) = choice.delta.content {
+                            if reasoning_open {
+                                output_buffer.push_str("</think>");
+                                on_token("</think>");
+                                reasoning_open = false;
+                            }
                             output_buffer.push_str(content);
                             on_token(content);
                         }
@@ -1235,6 +1428,11 @@ where F: FnMut(&str) {
         }
         
         buffer = last_part;
+    }
+
+    if reasoning_open {
+        output_buffer.push_str("</think>");
+        on_token("</think>");
     }
 
     Ok(())

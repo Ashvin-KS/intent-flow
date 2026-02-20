@@ -6,9 +6,11 @@ use crate::models::Settings;
 
 fn load_settings(app_handle: &AppHandle) -> Option<Settings> {
     let data_dir = app_handle.path().app_data_dir().ok()?;
-    let settings_path = data_dir.join("settings.json");
+    let settings_path = data_dir.join("config").join("settings.json");
     let data = std::fs::read_to_string(settings_path).ok()?;
-    serde_json::from_str(&data).ok()
+    let mut settings: Settings = serde_json::from_str(&data).ok()?;
+    crate::utils::config::apply_env_defaults(&mut settings);
+    Some(settings)
 }
 
 fn load_recent_chat_context(
@@ -59,6 +61,14 @@ pub struct ChatMessageResponse {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentModel {
+    pub id: String,
+    pub name: String,
+    pub use_count: i32,
+    pub last_used: i64,
+}
+
 // ─── Commands ───
 
 #[tauri::command]
@@ -89,7 +99,15 @@ pub async fn get_chat_sessions(app_handle: AppHandle) -> Result<Vec<ChatSession>
     let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
 
     let mut stmt = conn.prepare(
-        "SELECT id, title, created_at, updated_at FROM chat_sessions ORDER BY updated_at DESC"
+        "SELECT s.id, s.title, s.created_at, s.updated_at
+         FROM chat_sessions s
+         INNER JOIN (
+            SELECT session_id, COUNT(*) as msg_count
+            FROM chat_messages
+            GROUP BY session_id
+         ) m ON m.session_id = s.id
+         WHERE m.msg_count > 0
+         ORDER BY s.updated_at DESC"
     ).map_err(|e| e.to_string())?;
 
     let sessions = stmt.query_map([], |row| {
@@ -160,6 +178,7 @@ pub async fn send_chat_message(
     app_handle: AppHandle,
     session_id: String,
     message: String,
+    model: Option<String>,
 ) -> Result<ChatMessageResponse, String> {
     let now = Utc::now().timestamp();
     let data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -207,9 +226,13 @@ pub async fn send_chat_message(
     }
 
     // 3. Run agentic search with conversation context
-    let settings = load_settings(&app_handle).unwrap_or_default();
+    let mut settings = load_settings(&app_handle).unwrap_or_default();
+    if let Some(model_id) = model.as_ref().map(|m| m.trim()).filter(|m| !m.is_empty()) {
+        settings.ai.model = model_id.to_string();
+    }
+    let resolved_api_key = crate::utils::config::resolve_api_key(&settings.ai.api_key);
     
-    let agent_result = if settings.ai.enabled && !settings.ai.api_key.is_empty() {
+    let agent_result = if settings.ai.enabled && !resolved_api_key.is_empty() {
         crate::services::query_engine::run_agentic_search_with_steps_and_history(
             &app_handle,
             &message,
@@ -250,6 +273,20 @@ pub async fn send_chat_message(
 
     let msg_id = conn.last_insert_rowid();
 
+    // Track recently used model for quick selection.
+    let model_id = settings.ai.model.trim();
+    if !model_id.is_empty() {
+        let _ = conn.execute(
+            "INSERT INTO ai_model_usage (model_id, model_name, use_count, last_used)
+             VALUES (?1, ?2, 1, ?3)
+             ON CONFLICT(model_id) DO UPDATE SET
+                model_name = excluded.model_name,
+                use_count = ai_model_usage.use_count + 1,
+                last_used = excluded.last_used",
+            rusqlite::params![model_id, model_id, response_time],
+        );
+    }
+
     Ok(ChatMessageResponse {
         id: msg_id,
         session_id,
@@ -259,4 +296,53 @@ pub async fn send_chat_message(
         activities: Some(agent_result.activities_referenced),
         created_at: response_time,
     })
+}
+
+#[tauri::command]
+pub async fn get_recent_models(
+    app_handle: AppHandle,
+    limit: Option<i32>,
+) -> Result<Vec<RecentModel>, String> {
+    let data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+    let db_path = data_dir.join("intentflow.db");
+    let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let row_limit = limit.unwrap_or(5).clamp(1, 20);
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT model_id, model_name, use_count, last_used
+             FROM ai_model_usage
+             ORDER BY last_used DESC
+             LIMIT ?1",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let rows = stmt
+        .query_map([row_limit], |row| {
+            Ok(RecentModel {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                use_count: row.get(2)?,
+                last_used: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+#[tauri::command]
+pub async fn remove_recent_model(
+    app_handle: AppHandle,
+    model_id: String,
+) -> Result<(), String> {
+    let data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+    let db_path = data_dir.join("intentflow.db");
+    let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM ai_model_usage WHERE model_id = ?1",
+        [&model_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }

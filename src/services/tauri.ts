@@ -13,6 +13,7 @@ import type {
   StorageStats,
   ChatSession,
   ChatMessage,
+  DashboardOverview,
 } from '../types';
 
 // Activity commands
@@ -134,8 +135,23 @@ export interface ModelInfo {
   name: string;
 }
 
+export interface RecentModel {
+  id: string;
+  name: string;
+  use_count: number;
+  last_used: number;
+}
+
 export async function getNvidiaModels(apiKey: string): Promise<ModelInfo[]> {
   return invoke('get_nvidia_models', { apiKey });
+}
+
+export async function getRecentModels(limit = 5): Promise<RecentModel[]> {
+  return invoke('get_recent_models', { limit });
+}
+
+export async function removeRecentModel(modelId: string): Promise<void> {
+  return invoke('remove_recent_model', { modelId });
 }
 
 // Storage commands
@@ -181,7 +197,16 @@ export async function getChatMessages(sessionId: string): Promise<ChatMessage[]>
   return invoke('get_chat_messages', { sessionId });
 }
 
-export async function sendChatMessage(sessionId: string, message: string): Promise<ChatMessage> {
-  return invoke('send_chat_message', { sessionId, message });
+export async function sendChatMessage(sessionId: string, message: string, model?: string): Promise<ChatMessage> {
+  return invoke('send_chat_message', { sessionId, message, model });
+}
+
+// Dashboard commands
+export async function getDashboardOverview(refresh = false): Promise<DashboardOverview> {
+  return invoke('get_dashboard_overview', { refresh });
+}
+
+export async function refreshDashboardOverview(): Promise<DashboardOverview> {
+  return invoke('refresh_dashboard_overview');
 }
 
