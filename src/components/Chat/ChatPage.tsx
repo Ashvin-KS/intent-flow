@@ -43,6 +43,7 @@ const TIME_RANGE_OPTIONS = [
     { id: 'last_3_days', label: 'Last 3 Days' },
     { id: 'last_7_days', label: 'Last 7 Days' },
     { id: 'last_30_days', label: 'Last 30 Days' },
+    { id: 'this_year', label: 'This Year' },
     { id: 'all_time', label: 'All Time' },
 ];
 
@@ -51,6 +52,35 @@ interface ChatPageProps {
 }
 
 const CHAT_MODEL_STORAGE_KEY = 'intentflow_chat_selected_model';
+
+interface ConfirmActionPayload {
+    kind: string;
+    reason: string;
+    suggested_time_range?: string;
+    enable_sources?: string[];
+    retry_message: string;
+}
+
+interface ParsedAssistantAction {
+    cleanedContent: string;
+    action: ConfirmActionPayload | null;
+}
+
+function parseAssistantAction(content: string): ParsedAssistantAction {
+    const marker = /\[\[IF_ACTION:(\{[\s\S]*\})\]\]/m;
+    const match = content.match(marker);
+    if (!match) {
+        return { cleanedContent: content, action: null };
+    }
+    let action: ConfirmActionPayload | null = null;
+    try {
+        action = JSON.parse(match[1]) as ConfirmActionPayload;
+    } catch {
+        action = null;
+    }
+    const cleanedContent = content.replace(marker, '').trim();
+    return { cleanedContent, action };
+}
 
 function loadSelectedModelFromStorage(): string {
     try {
@@ -83,6 +113,7 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
     );
     const [selectedTimeRange, setSelectedTimeRange] = useState('today');
     const [selectedModel, setSelectedModel] = useState<string>(loadSelectedModelFromStorage);
+    const [pendingAction, setPendingAction] = useState<ConfirmActionPayload | null>(null);
 
     // Hooks
     const { favorites, addFavorite } = useFavoriteModels();
@@ -249,7 +280,10 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
         }
     };
 
-    const handleSendWithMessage = async (messageText: string) => {
+    const handleSendWithMessage = async (
+        messageText: string,
+        overrides?: { timeRange?: string; sources?: string[] }
+    ) => {
         if (!messageText.trim() || isSending) return;
 
         let sessionId = activeSessionId;
@@ -284,13 +318,22 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
                 sessionId,
                 messageText.trim(),
                 selectedModel || undefined,
-                selectedTimeRange
+                overrides?.timeRange || selectedTimeRange,
+                overrides?.sources || selectedSources
             );
+            const { cleanedContent, action } = parseAssistantAction(response.content);
+            const normalizedResponse: ChatMessageType = {
+                ...response,
+                content: cleanedContent || 'Please confirm the suggested scope/source update to continue.',
+            };
             if (selectedModel) {
                 const selected = favorites.find((f) => f.id === selectedModel);
                 addFavorite({ id: selectedModel, name: selected?.name || selectedModel });
             }
-            setMessages((prev) => [...prev, response]);
+            setMessages((prev) => [...prev, normalizedResponse]);
+            if (action?.kind === 'confirm_scope_or_sources') {
+                setPendingAction(action);
+            }
             loadSessions(); // Refresh sessions to update titles
         } catch (error) {
             console.error('Failed to send message:', error);
@@ -329,9 +372,15 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
 
     const renderStreamingMessage = () => {
         if (!streamingContent) return null;
+        const normalized = streamingContent.trim();
         const looksLikeToolJson =
-            streamingContent.trim().startsWith('{') ||
-            (streamingContent.includes('"tool"') && streamingContent.includes('"args"'));
+            normalized.startsWith('{') ||
+            normalized.startsWith(', "reasoning"') ||
+            streamingContent.includes('"tool"') ||
+            streamingContent.includes('"args"') ||
+            streamingContent.includes('"reasoning"') ||
+            streamingContent.includes('<|tool_') ||
+            streamingContent.includes('tool_call_');
         if (looksLikeToolJson) {
             const toolNameMatch = streamingContent.match(/"tool"\s*:\s*"([^"]+)"/);
             const reasoningMatch = streamingContent.match(/"reasoning"\s*:\s*"([\s\S]*?)"/);
@@ -380,6 +429,34 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
         if (selectedSources.length === SOURCE_OPTIONS.length) return 'All Sources';
         if (selectedSources.length === 0) return 'No Sources';
         return `${selectedSources.length} Sources`;
+    };
+
+    const getSourceLabelById = (id: string) =>
+        SOURCE_OPTIONS.find((s) => s.id === id)?.label || id;
+
+    const getTimeRangeLabelById = (id?: string) =>
+        TIME_RANGE_OPTIONS.find((t) => t.id === id)?.label || id || '';
+
+    const handleConfirmAction = async () => {
+        if (!pendingAction) return;
+        const nextTimeRange = pendingAction.suggested_time_range || selectedTimeRange;
+        const nextSources = Array.from(
+            new Set([...(selectedSources || []), ...(pendingAction.enable_sources || [])])
+        );
+
+        if (pendingAction.suggested_time_range) {
+            setSelectedTimeRange(nextTimeRange);
+        }
+        if ((pendingAction.enable_sources || []).length > 0) {
+            setSelectedSources(nextSources);
+        }
+
+        const retryMessage = pendingAction.retry_message || input.trim();
+        setPendingAction(null);
+        await handleSendWithMessage(retryMessage, {
+            timeRange: nextTimeRange,
+            sources: nextSources,
+        });
     };
 
     const formatSessionDate = (timestamp: number) => {
@@ -717,6 +794,46 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
                     </div>
                 )}
             </div>
+
+            {pendingAction && (
+                <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/55 px-4">
+                    <div className="w-full max-w-md rounded-2xl border border-dark-700 bg-dark-900 p-5 shadow-2xl">
+                        <h3 className="text-sm font-semibold text-white">Allow Scope Update?</h3>
+                        <p className="mt-2 text-xs text-dark-300 leading-relaxed">{pendingAction.reason}</p>
+                        {pendingAction.suggested_time_range && (
+                            <p className="mt-2 text-xs text-dark-200">
+                                Time range change:
+                                <span className="text-blue-400"> {getTimeRangeLabelById(selectedTimeRange)}</span>
+                                {' -> '}
+                                <span className="text-blue-400">{getTimeRangeLabelById(pendingAction.suggested_time_range)}</span>
+                            </p>
+                        )}
+                        {(pendingAction.enable_sources || []).length > 0 && (
+                            <p className="mt-2 text-xs text-dark-200">
+                                Enable sources:
+                                <span className="text-blue-400">
+                                    {' '}
+                                    {(pendingAction.enable_sources || []).map(getSourceLabelById).join(', ')}
+                                </span>
+                            </p>
+                        )}
+                        <div className="mt-4 flex items-center justify-end gap-2">
+                            <button
+                                onClick={() => setPendingAction(null)}
+                                className="px-3 py-1.5 rounded-lg border border-dark-700 text-xs text-dark-300 hover:text-white hover:border-dark-600 transition-colors"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handleConfirmAction}
+                                className="px-3 py-1.5 rounded-lg bg-blue-600 text-xs text-white hover:bg-blue-500 transition-colors"
+                            >
+                                Yes, Continue
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }

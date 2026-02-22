@@ -1,8 +1,9 @@
-use chrono::Utc;
+use chrono::{Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 use crate::models::Settings;
+use std::collections::HashSet;
 
 fn load_settings(app_handle: &AppHandle) -> Option<Settings> {
     let data_dir = app_handle.path().app_data_dir().ok()?;
@@ -180,6 +181,7 @@ pub async fn send_chat_message(
     message: String,
     model: Option<String>,
     time_range: Option<String>,
+    selected_sources: Option<Vec<String>>,
 ) -> Result<ChatMessageResponse, String> {
     let now = Utc::now().timestamp();
     let data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -226,17 +228,34 @@ pub async fn send_chat_message(
         }
     }
 
-    // 3. Run agentic search with conversation context
+    // 4. Run agentic search with conversation context
     let mut settings = load_settings(&app_handle).unwrap_or_default();
     if let Some(model_id) = model.as_ref().map(|m| m.trim()).filter(|m| !m.is_empty()) {
         settings.ai.model = model_id.to_string();
     }
     let resolved_api_key = crate::utils::config::resolve_api_key(&settings.ai.api_key);
     
+    let scoped_query = if let Some(sources) = selected_sources.as_ref() {
+        if sources.is_empty() {
+            format!(
+                "{}\n\nEnabled data sources: none.\nIf evidence is insufficient, ask the user to enable relevant sources before concluding.",
+                message
+            )
+        } else {
+            format!(
+                "{}\n\nEnabled data sources: {}.\nIf evidence is insufficient due to disabled sources or narrow time range, ask the user to expand them before concluding.",
+                message,
+                sources.join(", ")
+            )
+        }
+    } else {
+        message.clone()
+    };
+
     let agent_result = if settings.ai.enabled && !resolved_api_key.is_empty() {
         crate::services::query_engine::run_agentic_search_with_steps_and_history_and_scope(
             &app_handle,
-            &message,
+            &scoped_query,
             &settings,
             &recent_context,
             time_range.as_deref(),
@@ -254,7 +273,7 @@ pub async fn send_chat_message(
         }
     };
 
-    // 4. Store assistant message with steps + activities
+    // 5. Store assistant message with steps + activities
     let response_time = Utc::now().timestamp();
     let steps_json = serde_json::to_string(&agent_result.steps).ok();
     let activities_json = serde_json::to_string(&agent_result.activities_referenced).ok();

@@ -28,7 +28,7 @@ export function ChatMessage({ message, isStreaming = false }: ChatMessageProps) 
     const { answerText, thinkingText } = splitThinkingContent(message.content);
     const hasThinking = !isUser && thinkingText.length > 0;
     const bubbleTextRaw = isUser ? message.content : answerText || (hasThinking ? 'Thinking...' : message.content);
-    const bubbleText = isUser ? bubbleTextRaw : stripToolJsonPayloads(bubbleTextRaw).trim();
+    const bubbleText = isUser ? bubbleTextRaw : stripReasoningLeaks(stripToolJsonPayloads(bubbleTextRaw)).trim();
 
     useEffect(() => {
         if (!isStreaming || isUser) {
@@ -197,28 +197,29 @@ function MarkdownMessage({ text }: { text: string }) {
 }
 
 function splitThinkingContent(content: string): { answerText: string; thinkingText: string } {
-    const openTag = /<think>/i;
-    const closeTag = /<\/think>/i;
-    const openMatch = openTag.exec(content);
-    if (!openMatch) {
-        return { answerText: stripToolJsonPayloads(content), thinkingText: '' };
+    let answerText = content;
+    let thinkingText = '';
+    
+    const thinkRegex = /<think[^>]*>([\s\S]*?)<\/think>/gi;
+    let match;
+    
+    while ((match = thinkRegex.exec(content)) !== null) {
+        thinkingText += match[1] + '\n';
+        answerText = answerText.replace(match[0], '');
     }
-
-    const openIndex = openMatch.index;
-    const openEnd = openIndex + openMatch[0].length;
-    const closeMatch = closeTag.exec(content.slice(openEnd));
-
-    if (!closeMatch) {
-        const before = content.slice(0, openIndex).trim();
-        const thinking = sanitizeThinkingText(content.slice(openEnd).trim());
-        return { answerText: before, thinkingText: thinking };
+    
+    // Handle unclosed <think> tag at the end
+    const unclosedThinkRegex = /<think[^>]*>([\s\S]*)$/i;
+    const unclosedMatch = unclosedThinkRegex.exec(answerText);
+    if (unclosedMatch) {
+        thinkingText += unclosedMatch[1] + '\n';
+        answerText = answerText.replace(unclosedMatch[0], '');
     }
-
-    const closeStart = openEnd + closeMatch.index;
-    const closeEnd = closeStart + closeMatch[0].length;
-    const thinking = sanitizeThinkingText(content.slice(openEnd, closeStart).trim());
-    const answer = `${content.slice(0, openIndex)}${content.slice(closeEnd)}`.trim();
-    return { answerText: stripToolJsonPayloads(answer), thinkingText: thinking };
+    
+    return { 
+        answerText: stripToolJsonPayloads(answerText).trim(), 
+        thinkingText: sanitizeThinkingText(thinkingText.trim()) 
+    };
 }
 
 function sanitizeThinkingText(raw: string): string {
@@ -278,8 +279,114 @@ function extractJsonObject(text: string): string | null {
 }
 
 function stripToolJsonPayloads(text: string): string {
-    const pattern = /\{[\s\S]*?"tool"\s*:[\s\S]*?"args"\s*:[\s\S]*?\}/g;
-    return text.replace(pattern, '').replace(/\n{3,}/g, '\n\n');
+    let result = text;
+    
+    // Remove markdown json blocks containing tool calls
+    result = result.replace(/```(?:json)?\s*([\s\S]*?)\s*```/g, (match, content) => {
+        if (content.includes('"tool"') && content.includes('"args"')) return '';
+        return match;
+    });
+
+    // Use a brace matcher to remove top-level JSON objects containing "tool" and "args"
+    let cleaned = '';
+    let depth = 0;
+    let startIdx = 0;
+    let inString = false;
+    let escape = false;
+    
+    for (let i = 0; i < result.length; i++) {
+        const char = result[i];
+        
+        if (inString) {
+            if (escape) {
+                escape = false;
+            } else if (char === '\\') {
+                escape = true;
+            } else if (char === '"') {
+                inString = false;
+            }
+            continue;
+        }
+        
+        if (char === '"') {
+            inString = true;
+            continue;
+        }
+        
+        if (char === '{') {
+            if (depth === 0) {
+                cleaned += result.slice(startIdx, i);
+                startIdx = i;
+            }
+            depth++;
+            continue;
+        }
+        
+        if (char === '}') {
+            if (depth > 0) {
+                depth--;
+                if (depth === 0) {
+                    const objStr = result.slice(startIdx, i + 1);
+                    if (objStr.includes('"tool"') && objStr.includes('"args"')) {
+                        // It's a tool call, discard it
+                    } else {
+                        // Not a tool call, keep it
+                        cleaned += objStr;
+                    }
+                    startIdx = i + 1;
+                }
+            }
+            continue;
+        }
+    }
+    
+    // Append whatever is left
+    if (startIdx < result.length) {
+        const leftover = result.slice(startIdx);
+        // If leftover is an incomplete tool call (streaming), hide it
+        if (depth > 0 && leftover.includes('"tool"')) {
+            // Hide it
+        } else {
+            cleaned += leftover;
+        }
+    }
+    
+    result = cleaned;
+
+    // Clean up leftover array brackets and commas
+    result = result.replace(/^[\s\[\],]+$/g, '');
+    result = result.replace(/\[\s*(?:,\s*)*\]/g, '');
+    result = result.replace(/,\s*(?=\])/g, ''); // trailing commas in arrays
+    result = result.replace(/^,\s*/g, ''); // leading commas
+
+    return result
+        .replace(/<\|tool_calls_section_begin\|>/gi, '')
+        .replace(/<\|tool_calls_section_end\|>/gi, '')
+        .replace(/<\|tool_call_begin\|>/gi, '')
+        .replace(/<\|tool_call_end\|>/gi, '')
+        .replace(/<\|tool_call_argument_begin\|>/gi, '')
+        .replace(/\[\[IF_ACTION:\{[\s\S]*?\}\]\]/gi, '')
+        .replace(/<think[^>]*>/gi, '')
+        .replace(/<\/think>/gi, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+/**
+ * Strip leaked reasoning fragments like:
+ *   , "reasoning": "Cast a wider net for romantic keywords beyond "crush" and "like"..."}
+ * These leak when the LLM outputs unescaped quotes inside JSON reasoning fields.
+ */
+function stripReasoningLeaks(text: string): string {
+    // Remove lines that are just `"reasoning": "..."}` or `, "reasoning": "..."`
+    let result = text.replace(/,?\s*"reasoning"\s*:\s*"[^\n]*$/gm, '');
+    // Remove orphan lines starting with `, "` that look like JSON field debris  
+    result = result.replace(/^\s*,\s*"\w+"\s*:\s*"[^"]*"\s*\}?\s*$/gm, '');
+    // Remove lines that are just closing braces from stripped JSON
+    result = result.replace(/^\s*\}\s*$/gm, '');
+    // Clean up excessive blank lines
+    result = result.replace(/\n{3,}/g, '\n\n');
+    return result.trim();
 }
 
 function AgentStepCard({ step }: { step: AgentStep }) {

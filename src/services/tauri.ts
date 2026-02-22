@@ -201,9 +201,10 @@ export async function sendChatMessage(
   sessionId: string,
   message: string,
   model?: string,
-  timeRange?: string
+  timeRange?: string,
+  selectedSources?: string[]
 ): Promise<ChatMessage> {
-  return invoke('send_chat_message', { sessionId, message, model, timeRange });
+  return invoke('send_chat_message', { sessionId, message, model, timeRange, selectedSources });
 }
 
 // Dashboard commands

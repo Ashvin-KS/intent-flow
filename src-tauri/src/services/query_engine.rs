@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::models::{Settings, ActivityMetadata};
 use tauri::{Manager, Emitter};
-use chrono::{Duration, Local, TimeZone};
+use chrono::{Datelike, Duration, Local, TimeZone};
 use std::time::Duration as StdDuration;
 
 // ─── Constants ───
@@ -103,6 +103,13 @@ You have access to the user's activity history (apps, windows, duration, time) a
    - Args: calls = [{tool: "...", args: {...}}, ...]
    - Use for complex queries that need combining activity + OCR + music evidence quickly
 
+9. `resolve_query_scope` - Widen the time range or request additional data sources
+   - Args: suggested_scope (one of: "today", "yesterday", "last_3_days", "last_7_days", "last_30_days", "this_year", "all_time"), enable_sources (optional array of: "apps", "screen", "media", "browser", "files"), reason (string explaining why)
+   - Use when user's query implies a different time range than what is currently selected (e.g. "few days back", "from the start", "not just today", "earlier")
+   - Use when you need data sources that are not currently enabled
+   - Returns a confirmation prompt to the user; after user confirms, the query re-runs with the new scope
+   - ALWAYS use this tool when the user says things like "not just today", "days back", "from the start", "earlier", "before", "across days", "overall", "from few days", etc.
+
 ## Category IDs
 - 1 = Development | 2 = Browser | 3 = Communication | 4 = Entertainment | 5 = Productivity | 6 = System | 7 = Other
 
@@ -123,10 +130,23 @@ You have access to the user's activity history (apps, windows, duration, time) a
 14. For underspecified queries (missing source/app or time intent), ask a short clarifying question before searching.
 15. If you are asked about people, names, or girls, use `search_ocr` with a high limit and try different keywords or no keywords at all to get all the data.
 16. If you are asked about chats, use `get_recent_ocr` with a high limit and try different apps like "whatsapp", "instagram", "telegram", etc.
+17. For person-identity queries (for example: "who is my crush"), never guess. Gather evidence using at least 2 distinct tools first; if evidence is weak or conflicting, ask a clarification question.
+18. For any non-trivial factual query, fetch tool evidence before giving a final answer. If a final answer is attempted without evidence, call tools first.
+19. Never claim the user texted/chatted someone unless there is explicit chat-app evidence (e.g., WhatsApp/Telegram/Instagram chat OCR/activity) in the current time scope.
+20. For large-range summaries (like "this year" or "all time"), collect evidence in multiple compact aggregation steps (usage stats + grouped SQL rollups + focused slices) before writing the final answer.
+21. For complex queries, especially those about people, relationships, or identifying someone (e.g., "who is my crush"), you MUST make a minimum of 5 distinct tool calls to gather comprehensive evidence across different apps, timeframes, and contexts before providing a final answer. Do not jump to conclusions based on limited recent data.
+22. If the user asks a general question about habits, preferences, relationships, history, or asks "when", "how often", "first time", "ever" AND the current scope is narrow (like "Today" or "Last 7 Days"), you MUST call `resolve_query_scope` IMMEDIATELY as your first tool call to widen the scope to "last_30_days" or "all_time". Do NOT attempt to answer general or historical questions with just a few days of data. Also use this tool if the user's query implies a time range broader than the current scope (e.g., "few days back", "not just today", "earlier", "from the start", "before", "overall", "from the beginning", "across days", "the other day", "days ago", "recently" when scope is Today).
+23. If you detect the user needs data from sources that are not currently enabled (e.g., asking about files but Files source is disabled, or asking about browser history but Browser source is disabled), call `resolve_query_scope` with the required enable_sources array so the user can enable them.
 
 ## Response Format
 Output JSON for tool calls: { "tool": "tool_name", "args": { ... }, "reasoning": "..." }
 Output detailed, crisp, and highly specific final answers. Use markdown (like bolding and bullet points) to make the answer easy to read.
+For final answers, include:
+- A direct answer first
+- Evidence bullets with specific app/window/title + timestamp
+- A short confidence statement
+- If evidence is incomplete, explicitly say what is missing
+Do not be overly brief for non-trivial queries.
 
 Do NOT output markdown code blocks for tool calls. Output RAW JSON only.
 
@@ -255,7 +275,7 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
     
     let mut steps: Vec<AgentStep> = Vec::new();
     let mut all_activities: Vec<Value> = Vec::new();
-    let resolved_scope = resolve_time_scope(time_scope, user_query);
+    let resolved_scope = resolve_time_scope(time_scope);
     let intent = detect_query_intent(user_query);
     
     // Initial messages
@@ -280,19 +300,53 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
         });
     }
 
+    let needs_broad_scope = requires_broad_scope(user_query);
+    let scope_warning = if needs_broad_scope && (resolved_scope.id == "today" || resolved_scope.id == "yesterday" || resolved_scope.id == "last_3_days" || resolved_scope.id == "last_7_days") {
+        "\nCRITICAL: Your current search scope is narrow, but the user's query requires historical data, aggregation, or general knowledge about their habits/relationships. You MUST call `resolve_query_scope` immediately to widen the scope to 'last_30_days' or 'all_time' before doing anything else."
+    } else {
+        ""
+    };
+
     messages.push(ChatMessage {
         role: "user".to_string(),
         content: format!(
-            "User query: \"{}\"\nCurrent Time: {}\nSelected Time Scope: {} ({} to {})\nAlways keep retrieval strictly inside this scope unless the user asks to change it. If you need to search for people, names, or girls, use `search_ocr` with a high limit and try different keywords or no keywords at all to get all the data. If you need to search for chats, use `get_recent_ocr` with a high limit and try different apps like \"whatsapp\", \"instagram\", \"telegram\", etc.",
+            "User query: \"{}\"\nCurrent Time: {}\nSelected Time Scope: {} ({} to {})\nAlways keep retrieval strictly inside this scope unless the user asks to change it. If you need to search for people, names, or girls, use `search_ocr` with a high limit and try different keywords or no keywords at all to get all the data. If you need to search for chats, use `get_recent_ocr` with a high limit and try different apps like \"whatsapp\", \"instagram\", \"telegram\", etc.{}",
             user_query,
             chrono::Local::now().to_rfc3339(),
             resolved_scope.label,
             format_time_scope_ts(resolved_scope.start_ts),
-            format_time_scope_ts(resolved_scope.end_ts)
+            format_time_scope_ts(resolved_scope.end_ts),
+            scope_warning
         ),
     });
 
-    if intent.broad_summary {
+    let use_long_range_pipeline = should_use_long_range_pipeline(user_query, &resolved_scope, &intent);
+    if use_long_range_pipeline {
+        let _ = app_handle.emit("chat://status", "Building long-range evidence (multi-step)...");
+        if let Ok((pipeline_steps, pipeline_activities, digest)) =
+            run_long_range_summary_pipeline(&db_path, &resolved_scope, &intent, user_query)
+        {
+            let start_turn = steps.len();
+            for (idx, mut step) in pipeline_steps.into_iter().enumerate() {
+                step.turn = start_turn + idx + 1;
+                steps.push(step);
+            }
+            if !pipeline_activities.is_empty() {
+                all_activities.extend(pipeline_activities);
+                dedupe_activities(&mut all_activities);
+                if !intent.wants_music {
+                    all_activities.retain(|item| !is_media_activity_ref(item));
+                }
+            }
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: format!(
+                    "Pre-aggregated long-range evidence:\n{}\nUse this structured evidence first. Only call extra tools if there are clear gaps.",
+                    truncate_for_token_limit(&digest, 3500)
+                ),
+            });
+        }
+    } else if intent.broad_summary {
         let prefetch_args = build_prefetch_parallel_args(&resolved_scope, &intent);
         if let Ok((prefetch_output, prefetch_activities)) =
             execute_parallel_search(&db_path, &prefetch_args, Some(&resolved_scope), user_query)
@@ -317,6 +371,10 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
         }
     }
 
+    let must_validate_with_tools = requires_evidence_for_query(user_query);
+    let mut final_without_evidence_attempts = 0usize;
+    let mut forced_parallel_runs = 0usize;
+
     for turn in 0..MAX_TURNS {
         let _ = app_handle.emit("chat://status", format!("Thinking (step {}/{})", turn + 1, MAX_TURNS));
         // 1. Call LLM with streaming callback
@@ -334,9 +392,19 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
             if sniff.contains("\"tool\"") && sniff.contains("\"args\"") {
                 suppress_stream = true;
             }
+            // Suppress any content containing "reasoning" key — this is always from tool-call JSON
+            if sniff.contains("\"reasoning\"") {
+                suppress_stream = true;
+            }
+            if contains_internal_tool_markup(&sniff) {
+                suppress_stream = true;
+            }
 
             if !suppress_stream {
-                let _ = app_handle.emit("chat://token", chunk);
+                let cleaned = strip_internal_stream_markup(chunk);
+                if !cleaned.trim().is_empty() {
+                    let _ = app_handle.emit("chat://token", &cleaned);
+                }
             }
         };
 
@@ -349,9 +417,130 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
         // 3. Handle Action
         match parsed_response {
             AgentResponse::FinalAnswer(answer) => {
+                let cleaned_answer = strip_internal_stream_markup(&answer)
+                    .replace("<think>", "")
+                    .replace("</think>", "");
+                let normalized = normalize_final_answer_hardened(&cleaned_answer);
+                let normalized = scrub_unsupported_communication_claims(&normalized, user_query, &steps);
+                if must_validate_with_tools && steps.is_empty() && forced_parallel_runs < 2 {
+                    let forced_args = build_forced_validation_parallel_args(&resolved_scope, &intent, user_query);
+                    let (out, activities) = execute_parallel_search(
+                        &db_path,
+                        &forced_args,
+                        Some(&resolved_scope),
+                        user_query,
+                    )?;
+                    forced_parallel_runs += 1;
+                    if !activities.is_empty() {
+                        all_activities.extend(activities);
+                        dedupe_activities(&mut all_activities);
+                    }
+                    let truncated = truncate_for_token_limit(&out, 8000);
+                    steps.push(AgentStep {
+                        turn: turn + 1,
+                        tool_name: "parallel_search".to_string(),
+                        tool_args: forced_args,
+                        tool_result: truncated.clone(),
+                        reasoning: "Forced evidence validation before final answer".to_string(),
+                    });
+                    messages.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: full_response.clone(),
+                    });
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: format!(
+                            "You attempted to answer without evidence. Use this forced evidence and continue with additional tool calls if needed:\n{}",
+                            truncate_for_token_limit(&truncated, 3500)
+                        ),
+                    });
+                    continue;
+                }
+                if contains_internal_tool_markup(&normalized) && turn + 1 < MAX_TURNS {
+                    messages.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: full_response.clone(),
+                    });
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: "Your last response leaked internal tool-call markup. Re-emit either valid RAW JSON tool call {\"tool\":\"...\",\"args\":{...}} or a normal final answer. Never output internal markers like <|tool_call_begin|>.".to_string(),
+                    });
+                    continue;
+                }
+                
+                let is_complex_query = user_query.to_lowercase().contains("who") || user_query.to_lowercase().contains("crush") || user_query.to_lowercase().contains("relationship");
+                if is_complex_query && steps.len() < 5 && turn + 1 < MAX_TURNS {
+                    messages.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: full_response.clone(),
+                    });
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: format!("You have only made {} tool calls. For this type of query, you MUST make at least 5 distinct tool calls to gather comprehensive evidence before answering. Please make another tool call.", steps.len()),
+                    });
+                    continue;
+                }
+
+                if !has_minimum_evidence_for_query(user_query, &steps) {
+                    final_without_evidence_attempts += 1;
+                    if must_validate_with_tools && final_without_evidence_attempts >= 2 && forced_parallel_runs < 2 {
+                        let forced_args = build_forced_validation_parallel_args(&resolved_scope, &intent, user_query);
+                        let (out, activities) = execute_parallel_search(
+                            &db_path,
+                            &forced_args,
+                            Some(&resolved_scope),
+                            user_query,
+                        )?;
+                        forced_parallel_runs += 1;
+                        if !activities.is_empty() {
+                            all_activities.extend(activities);
+                            dedupe_activities(&mut all_activities);
+                        }
+                        let truncated = truncate_for_token_limit(&out, 8000);
+                        steps.push(AgentStep {
+                            turn: turn + 1,
+                            tool_name: "parallel_search".to_string(),
+                            tool_args: forced_args,
+                            tool_result: truncated.clone(),
+                            reasoning: "Forced cross-tool evidence after weak finalization attempt".to_string(),
+                        });
+                        messages.push(ChatMessage {
+                            role: "assistant".to_string(),
+                            content: full_response.clone(),
+                        });
+                        messages.push(ChatMessage {
+                            role: "user".to_string(),
+                            content: format!(
+                                "Your answer was not sufficiently evidenced. Continue using this tool output and fetch more if needed:\n{}",
+                                truncate_for_token_limit(&truncated, 3500)
+                            ),
+                        });
+                        continue;
+                    }
+                    if turn + 1 < MAX_TURNS {
+                        messages.push(ChatMessage {
+                            role: "assistant".to_string(),
+                            content: full_response.clone(),
+                        });
+                        messages.push(ChatMessage {
+                            role: "user".to_string(),
+                            content: "Do not finalize yet. First gather stronger evidence with multiple relevant tools (for example OCR + activity/chat/file-change tools), then answer only from that evidence. If evidence is still weak, say so explicitly and ask a clarifying question.".to_string(),
+                        });
+                        continue;
+                    }
+                    let _ = app_handle.emit("chat://done", "final_answer");
+                    let action_marker = build_insufficient_evidence_action_marker(user_query, &resolved_scope);
+                    return Ok(AgentResult {
+                        answer: format!(
+                            "I don't have enough cross-checked evidence to answer confidently. Try widening the time range (Last 7 Days or All Time) and enabling Browser History / Files & Documents, then ask me to retry.{}",
+                            action_marker
+                        ),
+                        steps,
+                        activities_referenced: all_activities,
+                    });
+                }
                 // Done!
                 let _ = app_handle.emit("chat://done", "final_answer");
-                let normalized = normalize_final_answer(&answer);
                 return Ok(AgentResult {
                     answer: normalized,
                     steps,
@@ -359,6 +548,42 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
                 });
             }
             AgentResponse::ToolCall { tool, args, reasoning } => {
+                // Handle resolve_query_scope as a special case — it returns a user-facing action prompt
+                if tool == "resolve_query_scope" {
+                    let suggested_scope = args["suggested_scope"].as_str().unwrap_or("last_7_days");
+                    let reason = args["reason"].as_str().unwrap_or("Your query requires a wider search range.");
+                    let enable_sources: Vec<String> = args.get("enable_sources")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                        .unwrap_or_default();
+
+                    steps.push(AgentStep {
+                        turn: turn + 1,
+                        tool_name: "resolve_query_scope".to_string(),
+                        tool_args: args.clone(),
+                        tool_result: format!("Requesting scope change to {} with sources {:?}", suggested_scope, enable_sources),
+                        reasoning: reasoning.as_deref().unwrap_or("").to_string(),
+                    });
+
+                    let payload = serde_json::json!({
+                        "kind": "confirm_scope_or_sources",
+                        "reason": reason,
+                        "suggested_time_range": suggested_scope,
+                        "enable_sources": enable_sources,
+                        "retry_message": user_query
+                    });
+
+                    let _ = app_handle.emit("chat://done", "final_answer");
+                    return Ok(AgentResult {
+                        answer: format!(
+                            "I can answer this more accurately after your confirmation.\n\n[[IF_ACTION:{}]]",
+                            payload
+                        ),
+                        steps,
+                        activities_referenced: all_activities,
+                    });
+                }
+
                 let enforced_args = enforce_tool_args_with_scope(&tool, &args, &resolved_scope, user_query);
                 println!("[Agent] Turn {}: Calling {} ({:?})", turn + 1, tool, enforced_args);
                 let _ = app_handle.emit("chat://status", format!("Running {}", tool));
@@ -397,6 +622,9 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
                 // Add activities from tool result to referenced activities
                 all_activities.extend(transform_activities_for_frontend(&tool, &tool_activities));
                 dedupe_activities(&mut all_activities);
+                if !intent.wants_music {
+                    all_activities.retain(|item| !is_media_activity_ref(item));
+                }
                 let _ = app_handle.emit(
                     "chat://status",
                     format!("{} completed ({} referenced items)", tool, tool_activities.len())
@@ -475,6 +703,9 @@ fn detect_query_intent(query: &str) -> QueryIntent {
         || q.contains("everything")
         || q.contains("today")
         || q.contains("yesterday")
+        || q.contains("this year")
+        || q.contains("yearly")
+        || q.contains("annual")
         || (wants_timeline && (wants_ocr || wants_files || wants_music));
 
     QueryIntent {
@@ -486,44 +717,60 @@ fn detect_query_intent(query: &str) -> QueryIntent {
     }
 }
 
+fn requires_broad_scope(query: &str) -> bool {
+    let q = query.to_lowercase();
+    
+    let time_indicators = [
+        "first", "last time", "ever", "always", "never", "usually", "often", 
+        "history", "past", "before", "earlier", "since", "overall", "all time",
+        "months", "years", "weeks", "days ago", "long time", "recently"
+    ];
+    
+    let general_questions = [
+        "how many times", "how often", "when did i", "longest", "best", "worst", 
+        "favorite", "most", "top", "frequent"
+    ];
+    
+    let identity_questions = [
+        "who is", "what is my", "guess", "crush", "relationship", "friend", "girlfriend", "boyfriend"
+    ];
+
+    time_indicators.iter().any(|&w| q.contains(w)) ||
+    general_questions.iter().any(|&w| q.contains(w)) ||
+    identity_questions.iter().any(|&w| q.contains(w))
+}
+
 fn query_has_time_hint(query: &str) -> bool {
     let q = query.to_lowercase();
     q.contains("today")
         || q.contains("yesterday")
         || q.contains("last ")
         || q.contains("past ")
+        || q.contains("this year")
         || q.contains("this week")
         || q.contains("this month")
         || q.contains("right now")
         || q.contains("few mins")
+        || q.contains("few days")
+        || q.contains("days back")
+        || q.contains("days ago")
+        || q.contains("recently")
+        || q.contains("earlier")
+        || q.contains("before")
+        || q.contains("the other day")
+        || q.contains("not just today")
+        || q.contains("from the start")
+        || q.contains("from start")
+        || q.contains("beginning")
+        || q.contains("ever")
+        || q.contains("overall")
+        || q.contains("always")
+        || q.contains("couple day")
+        || q.contains("couple week")
+        || q.contains("few weeks")
+        || q.contains("month ago")
+        || q.contains("week ago")
         || q.chars().any(|c| c.is_ascii_digit())
-}
-
-fn parse_scope_id_from_query(query: &str) -> Option<&'static str> {
-    let q = query.to_lowercase();
-    if q.contains("yesterday")
-        || q.contains("yesteray")
-        || q.contains("yeterday")
-        || q.contains("yestarday")
-    {
-        return Some("yesterday");
-    }
-    if q.contains("last 3 day") || q.contains("past 3 day") {
-        return Some("last_3_days");
-    }
-    if q.contains("last 7 day") || q.contains("past week") || q.contains("last week") {
-        return Some("last_7_days");
-    }
-    if q.contains("last 30 day") || q.contains("past month") || q.contains("last month") {
-        return Some("last_30_days");
-    }
-    if q.contains("all time") || q.contains("ever") || q.contains("across all days") {
-        return Some("all_time");
-    }
-    if q.contains("today") || q.contains("so far") {
-        return Some("today");
-    }
-    None
 }
 
 fn local_day_bounds(days_ago: i64) -> Option<(i64, i64)> {
@@ -537,12 +784,11 @@ fn local_day_bounds(days_ago: i64) -> Option<(i64, i64)> {
     Some((start, end))
 }
 
-fn resolve_time_scope(explicit_scope: Option<&str>, query: &str) -> TimeScope {
+fn resolve_time_scope(explicit_scope: Option<&str>) -> TimeScope {
     let now = chrono::Utc::now().timestamp();
     let scope_id = explicit_scope
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.trim().to_lowercase())
-        .or_else(|| parse_scope_id_from_query(query).map(|s| s.to_string()))
         .unwrap_or_else(|| "today".to_string());
 
     match scope_id.as_str() {
@@ -561,6 +807,17 @@ fn resolve_time_scope(explicit_scope: Option<&str>, query: &str) -> TimeScope {
         "last_30_days" => {
             let start_ts = local_day_bounds(29).map(|(s, _)| s).unwrap_or(now - 30 * 86400);
             TimeScope { id: scope_id, label: "Last 30 Days".to_string(), start_ts, end_ts: now }
+        }
+        "this_year" => {
+            let local_now = Local::now();
+            let year = local_now.year();
+            let start_naive = chrono::NaiveDate::from_ymd_opt(year, 1, 1)
+                .and_then(|d| d.and_hms_opt(0, 0, 0));
+            let start_ts = start_naive
+                .and_then(|dt| local_now.timezone().from_local_datetime(&dt).single())
+                .map(|dt| dt.timestamp())
+                .unwrap_or(now - 365 * 86400);
+            TimeScope { id: scope_id, label: "This Year".to_string(), start_ts, end_ts: now }
         }
         "all_time" => TimeScope {
             id: scope_id,
@@ -691,6 +948,223 @@ fn build_prefetch_parallel_args(scope: &TimeScope, intent: &QueryIntent) -> Valu
     serde_json::json!({ "calls": calls })
 }
 
+fn build_forced_validation_parallel_args(scope: &TimeScope, intent: &QueryIntent, query: &str) -> Value {
+    let mut calls = vec![
+        serde_json::json!({
+            "tool": "get_recent_activities",
+            "args": { "limit": if scope.id == "all_time" { 120 } else { 80 }, "exclude_media_noise": !intent.wants_music }
+        }),
+        serde_json::json!({
+            "tool": "get_recent_ocr",
+            "args": { "limit": if scope.id == "all_time" { 120 } else { 80 } }
+        }),
+    ];
+
+    if intent.wants_files || query.to_lowercase().contains("project") || query.to_lowercase().contains("file") || query.to_lowercase().contains("code") {
+        calls.push(serde_json::json!({
+            "tool": "get_recent_file_changes",
+            "args": { "limit": if scope.id == "all_time" { 100 } else { 60 } }
+        }));
+    }
+
+    if intent.wants_music || query.to_lowercase().contains("song") || query.to_lowercase().contains("music") {
+        calls.push(serde_json::json!({
+            "tool": "get_music_history",
+            "args": { "limit": if scope.id == "all_time" { 80 } else { 50 } }
+        }));
+    }
+
+    serde_json::json!({ "calls": calls })
+}
+
+fn should_use_long_range_pipeline(query: &str, scope: &TimeScope, intent: &QueryIntent) -> bool {
+    let q = query.to_lowercase();
+    let summary_like = q.contains("summary")
+        || q.contains("overview")
+        || q.contains("recap")
+        || q.contains("what did i do")
+        || q.contains("this year")
+        || q.contains("yearly")
+        || q.contains("annual");
+    if !summary_like {
+        return false;
+    }
+    let span_days = ((scope.end_ts - scope.start_ts).max(0)) / 86_400;
+    scope.id == "this_year" || scope.id == "all_time" || span_days >= 90 || intent.broad_summary
+}
+
+fn run_long_range_summary_pipeline(
+    db_path: &std::path::Path,
+    scope: &TimeScope,
+    intent: &QueryIntent,
+    user_query: &str,
+) -> Result<(Vec<AgentStep>, Vec<Value>, String), String> {
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    let mut steps: Vec<AgentStep> = Vec::new();
+    let mut all_refs: Vec<Value> = Vec::new();
+    let mut digest_parts: Vec<String> = Vec::new();
+
+    // Step 1: Aggregate app usage for the whole range.
+    execute_and_record_long_range_step(
+        &conn,
+        scope,
+        user_query,
+        "get_usage_stats",
+        serde_json::json!({}),
+        "Aggregate usage baseline for long-range summary",
+        &mut steps,
+        &mut all_refs,
+        &mut digest_parts,
+    )?;
+
+    // Step 2: Monthly category rollup to avoid feeding raw per-event data.
+    let monthly_category_sql = format!(
+        "SELECT strftime('%Y-%m', datetime(start_time, 'unixepoch', 'localtime')) AS month, category_id, SUM(duration_seconds) AS total_seconds, COUNT(*) AS events \
+         FROM activities WHERE start_time >= {} AND start_time <= {} \
+         GROUP BY month, category_id \
+         ORDER BY month DESC, total_seconds DESC LIMIT 600",
+        scope.start_ts,
+        scope.end_ts
+    );
+    execute_and_record_long_range_step(
+        &conn,
+        scope,
+        user_query,
+        "query_activities",
+        serde_json::json!({ "query": monthly_category_sql }),
+        "Monthly category aggregation for long-range compression",
+        &mut steps,
+        &mut all_refs,
+        &mut digest_parts,
+    )?;
+
+    // Step 3: Top apps over the full range.
+    let top_apps_sql = format!(
+        "SELECT app_name, SUM(duration_seconds) AS total_seconds, COUNT(*) AS events \
+         FROM activities WHERE start_time >= {} AND start_time <= {} \
+         GROUP BY app_name \
+         ORDER BY total_seconds DESC LIMIT 40",
+        scope.start_ts,
+        scope.end_ts
+    );
+    execute_and_record_long_range_step(
+        &conn,
+        scope,
+        user_query,
+        "query_activities",
+        serde_json::json!({ "query": top_apps_sql }),
+        "Top apps aggregation for the selected long-range window",
+        &mut steps,
+        &mut all_refs,
+        &mut digest_parts,
+    )?;
+
+    // Step 4: Recent high-signal activity slice for concrete examples.
+    execute_and_record_long_range_step(
+        &conn,
+        scope,
+        user_query,
+        "get_recent_activities",
+        serde_json::json!({
+            "limit": if scope.id == "all_time" { 300 } else { 220 },
+            "exclude_media_noise": !intent.wants_music
+        }),
+        "Concrete activity slice for examples and chronology",
+        &mut steps,
+        &mut all_refs,
+        &mut digest_parts,
+    )?;
+
+    let q = user_query.to_lowercase();
+    let needs_files = intent.wants_files || q.contains("project") || q.contains("repo") || q.contains("code");
+    if needs_files {
+        execute_and_record_long_range_step(
+            &conn,
+            scope,
+            user_query,
+            "get_recent_file_changes",
+            serde_json::json!({ "limit": if scope.id == "all_time" { 220 } else { 160 } }),
+            "File-change slice for project/work summary",
+            &mut steps,
+            &mut all_refs,
+            &mut digest_parts,
+        )?;
+    }
+
+    let needs_chat = intent.wants_ocr || q.contains("chat") || q.contains("text") || q.contains("message");
+    if needs_chat {
+        execute_and_record_long_range_step(
+            &conn,
+            scope,
+            user_query,
+            "get_recent_ocr",
+            serde_json::json!({ "limit": if scope.id == "all_time" { 220 } else { 160 } }),
+            "OCR/chat slice for communication evidence",
+            &mut steps,
+            &mut all_refs,
+            &mut digest_parts,
+        )?;
+    }
+
+    if intent.wants_music || q.contains("music") || q.contains("song") {
+        execute_and_record_long_range_step(
+            &conn,
+            scope,
+            user_query,
+            "get_music_history",
+            serde_json::json!({ "limit": if scope.id == "all_time" { 140 } else { 100 } }),
+            "Music slice for media trend evidence",
+            &mut steps,
+            &mut all_refs,
+            &mut digest_parts,
+        )?;
+    }
+
+    let digest = digest_parts.join("\n\n");
+    Ok((steps, all_refs, digest))
+}
+
+fn execute_and_record_long_range_step(
+    conn: &Connection,
+    scope: &TimeScope,
+    user_query: &str,
+    tool: &str,
+    raw_args: Value,
+    reasoning: &str,
+    steps: &mut Vec<AgentStep>,
+    all_refs: &mut Vec<Value>,
+    digest_parts: &mut Vec<String>,
+) -> Result<(), String> {
+    let enforced_args = enforce_tool_args_with_scope(tool, &raw_args, scope, user_query);
+    let (tool_output, tool_activities, attempts_used) =
+        execute_tool_with_retries(conn, tool, &enforced_args, MAX_TOOL_RETRY_LOOPS)?;
+    let with_retry_note = if attempts_used > 1 {
+        format!(
+            "Auto-retried with broader search {} time(s).\n{}",
+            attempts_used - 1,
+            tool_output
+        )
+    } else {
+        tool_output
+    };
+    let truncated = truncate_for_token_limit(&with_retry_note, 10000);
+    steps.push(AgentStep {
+        turn: 0,
+        tool_name: tool.to_string(),
+        tool_args: enforced_args.clone(),
+        tool_result: truncated.clone(),
+        reasoning: reasoning.to_string(),
+    });
+    let refs = transform_activities_for_frontend(tool, &tool_activities);
+    all_refs.extend(refs);
+    digest_parts.push(format!(
+        "{} -> {}",
+        tool,
+        truncate_for_token_limit(&normalize_whitespace(&truncated), 900)
+    ));
+    Ok(())
+}
+
 fn dedupe_activities(activities: &mut Vec<Value>) {
     let mut seen = std::collections::HashSet::new();
     activities.retain(|item| {
@@ -700,6 +1174,14 @@ fn dedupe_activities(activities: &mut Vec<Value>) {
         let key = format!("{}|{}|{}", app, title, time);
         seen.insert(key)
     });
+}
+
+fn is_media_activity_ref(item: &Value) -> bool {
+    if item.get("media").and_then(|v| v.get("title")).is_some() {
+        return true;
+    }
+    let app = item.get("app").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+    app.contains("spotify") || app.contains("youtube music") || app.contains("apple music")
 }
 
 fn is_media_noise_event(event: &Value) -> bool {
@@ -1253,6 +1735,33 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
 
             Ok((formatted, changes))
         }
+        "resolve_query_scope" => {
+            // This tool lets the LLM request a wider time scope or additional sources.
+            // It returns a confirmation action marker that the frontend will show to the user.
+            let suggested_scope = args["suggested_scope"].as_str().unwrap_or("last_7_days");
+            let reason = args["reason"].as_str().unwrap_or("Your query requires a wider search range.");
+            let enable_sources: Vec<String> = args.get("enable_sources")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default();
+
+            let payload = serde_json::json!({
+                "kind": "confirm_scope_or_sources",
+                "reason": reason,
+                "suggested_time_range": suggested_scope,
+                "enable_sources": enable_sources,
+                "retry_message": "" // Will use the original query on retry
+            });
+
+            let output = format!(
+                "Scope change requested: time range → {}, additional sources → [{}]. Reason: {}",
+                suggested_scope,
+                enable_sources.join(", "),
+                reason
+            );
+
+            Ok((output, vec![payload]))
+        }
         "query_activities" => {
             let sql = args["query"].as_str().or_else(|| args["sql"].as_str())
                 .ok_or("Missing 'query' argument")?;
@@ -1326,6 +1835,9 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
             
             for r in rows {
                 if let Ok((start_time, app_name, window_title, duration_seconds, category_id, meta_blob)) = r {
+                     if app_name.to_lowercase().contains("intentflow") {
+                         continue;
+                     }
                      if let Some(blob) = meta_blob {
                         if let Ok(meta) = serde_json::from_slice::<ActivityMetadata>(&blob) {
                             if let Some(text) = meta.screen_text {
@@ -1415,6 +1927,9 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
             let mut results: Vec<Value> = Vec::new();
             for row in rows {
                 if let Ok((start_time, app_name, window_title, duration_seconds, category_id, metadata_blob)) = row {
+                    if app_name.to_lowercase().contains("intentflow") {
+                        continue;
+                    }
                     if let Some(blob) = metadata_blob {
                         if let Ok(meta) = serde_json::from_slice::<ActivityMetadata>(&blob) {
                             if let Some(text) = meta.screen_text {
@@ -1630,12 +2145,55 @@ fn normalize_final_answer(answer: &str) -> String {
         .to_string()
 }
 
+fn normalize_final_answer_hardened(answer: &str) -> String {
+    let cleaned = normalize_final_answer(answer);
+    let cleaned = strip_think_blocks(&cleaned);
+    let cleaned = strip_internal_stream_markup(&cleaned);
+    let cleaned = strip_reasoning_fragments(&cleaned);
+    cleaned
+        .lines()
+        .filter(|line| !contains_internal_tool_markup(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// Strip leaked `"reasoning": "..."` fragments and partial JSON tool-call debris from text.
+fn strip_reasoning_fragments(text: &str) -> String {
+    use regex::Regex;
+    // Match lines that are just reasoning fragments like:
+    //   , "reasoning": "some text here."}
+    //   "reasoning": "text"}
+    let re = Regex::new(r#"(?m)^\s*,?\s*"reasoning"\s*:\s*"[^}]*$"#).unwrap_or_else(|_| Regex::new(".").unwrap());
+    let result = re.replace_all(text, "").to_string();
+    
+    // Also strip lines that look like orphan fragments: starting with , "key": "..."
+    let re2 = Regex::new(r#"(?m)^\s*,\s*"\w+"\s*:\s*"[^"]*"\s*\}?\s*$"#).unwrap_or_else(|_| Regex::new(".").unwrap());
+    let result = re2.replace_all(&result, "").to_string();
+    
+    // Strip any remaining lines that are just `}` with no context
+    result
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            // Keep non-empty lines that aren't just JSON debris
+            !trimmed.is_empty() || true // keep blank lines for formatting
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn try_parse_tool_call_response(full_response: &str) -> Option<AgentResponse> {
-    let trimmed = full_response.trim();
+    let cleaned = strip_internal_stream_markup(full_response);
+    // Also strip <think>...</think> blocks that may wrap the tool call
+    let cleaned = strip_think_blocks(&cleaned);
+    let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         return None;
     }
 
+    // 1. Try direct parse
     if let Ok(resp) = serde_json::from_str::<AgentResponse>(trimmed) {
         if matches!(resp, AgentResponse::ToolCall { .. }) {
             return Some(resp);
@@ -1643,6 +2201,7 @@ fn try_parse_tool_call_response(full_response: &str) -> Option<AgentResponse> {
     }
 
     if trimmed.contains("\"tool\"") && trimmed.contains("\"args\"") {
+        // 2. Try extracting a top-level JSON object
         let start = trimmed.find('{')?;
         let end = trimmed.rfind('}')?;
         if end > start {
@@ -1652,10 +2211,331 @@ fn try_parse_tool_call_response(full_response: &str) -> Option<AgentResponse> {
                     return Some(resp);
                 }
             }
+
+            // 3. Try stripping the "reasoning" field entirely (it often has unescaped quotes)
+            if let Some(fixed) = try_fix_broken_reasoning_json(candidate) {
+                if let Ok(resp) = serde_json::from_str::<AgentResponse>(&fixed) {
+                    if matches!(resp, AgentResponse::ToolCall { .. }) {
+                        return Some(resp);
+                    }
+                }
+            }
         }
     }
 
     None
+}
+
+/// Strip <think>...</think> blocks (potentially unclosed) from a string.
+fn strip_think_blocks(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+    loop {
+        let lower = remaining.to_lowercase();
+        if let Some(open_pos) = lower.find("<think") {
+            // Find end of opening tag
+            let tag_end = remaining[open_pos..].find('>').map(|i| open_pos + i + 1).unwrap_or(remaining.len());
+            result.push_str(&remaining[..open_pos]);
+            if let Some(close_pos) = lower[tag_end..].find("</think>") {
+                remaining = &remaining[tag_end + close_pos + 8..];
+            } else {
+                // Unclosed tag - strip everything after it
+                break;
+            }
+        } else {
+            result.push_str(remaining);
+            break;
+        }
+    }
+    result
+}
+
+/// Try to fix broken JSON where the "reasoning" field has unescaped quotes.
+/// Strategy: find the "reasoning" key, find its value boundaries via brace/bracket depth,
+/// and either strip the field or fix the quoting.
+fn try_fix_broken_reasoning_json(json_str: &str) -> Option<String> {
+    // Strategy 1: Remove the "reasoning" field entirely and re-parse
+    // Find `"reasoning"` key position
+    let reasoning_key = json_str.find("\"reasoning\"")?;
+    let colon_pos = json_str[reasoning_key + 11..].find(':')? + reasoning_key + 11;
+    
+    // Find the start of the value (skip whitespace after colon)
+    let value_start_region = &json_str[colon_pos + 1..];
+    let value_offset = value_start_region.find(|c: char| !c.is_whitespace())?;
+    let abs_value_start = colon_pos + 1 + value_offset;
+    
+    if json_str.as_bytes().get(abs_value_start)? != &b'"' {
+        return None; // Not a string value
+    }
+    
+    // The value starts with a quote. We need to find where it truly ends.
+    // Since quotes inside are unescaped, find the last `"}` or `", ` before the final `}`.
+    // The final `}` of the whole object is at the end.
+    let last_brace = json_str.rfind('}')?;
+    
+    // Remove the reasoning field: everything from the comma (or opening) before "reasoning" to just before the closing brace
+    // Find the comma before "reasoning"
+    let before_reasoning = json_str[..reasoning_key].trim_end();
+    let stripped_before = if before_reasoning.ends_with(',') {
+        &before_reasoning[..before_reasoning.len() - 1]
+    } else {
+        before_reasoning
+    };
+    
+    // Build JSON without reasoning field
+    let fixed = format!("{}\n{}", stripped_before.trim_end(), &json_str[last_brace..]);
+    Some(fixed)
+}
+
+fn requires_multi_tool_validation(query: &str) -> bool {
+    let q = query.to_lowercase();
+    q.contains("who")
+        || q.contains("which")
+        || q.contains("name")
+        || q.contains("chat")
+        || q.contains("message")
+        || q.contains("project")
+        || q.contains("code")
+        || q.contains("file")
+        || q.contains("did i")
+        || q.contains("what did")
+        || q.contains("evidence")
+        || q.contains("confirm")
+}
+
+fn is_smalltalk_query(query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.len() <= 12 && (q == "hi" || q == "hello" || q == "hey" || q == "yo") {
+        return true;
+    }
+    q.contains("how are you")
+        || q.contains("thanks")
+        || q.contains("thank you")
+        || q.contains("good morning")
+        || q.contains("good night")
+}
+
+fn requires_evidence_for_query(query: &str) -> bool {
+    if is_smalltalk_query(query) {
+        return false;
+    }
+    true
+}
+
+fn build_insufficient_evidence_action_marker(query: &str, scope: &TimeScope) -> String {
+    let mut enable_sources: Vec<&str> = Vec::new();
+    let q = query.to_lowercase();
+    if q.contains("project") || q.contains("repo") || q.contains("code") || q.contains("file") {
+        enable_sources.push("files");
+    }
+    if q.contains("browser") || q.contains("website") || q.contains("history") || q.contains("linkedin") {
+        enable_sources.push("browser");
+    }
+    if q.contains("chat") || q.contains("text") || q.contains("message") {
+        enable_sources.push("screen");
+    }
+
+    let suggested_scope = if q.contains("this year") && scope.id != "this_year" {
+        "this_year"
+    } else if scope.id != "all_time" {
+        "all_time"
+    } else if scope.id != "last_7_days" {
+        "last_7_days"
+    } else {
+        ""
+    };
+
+    if suggested_scope.is_empty() && enable_sources.is_empty() {
+        return String::new();
+    }
+
+    let payload = serde_json::json!({
+        "kind": "confirm_scope_or_sources",
+        "reason": "Evidence is insufficient in the current scope/source settings.",
+        "suggested_time_range": if suggested_scope.is_empty() { Value::Null } else { Value::String(suggested_scope.to_string()) },
+        "enable_sources": enable_sources,
+        "retry_message": query
+    });
+    format!("\n\n[[IF_ACTION:{}]]", payload)
+}
+
+fn has_minimum_evidence_for_query(query: &str, steps: &[AgentStep]) -> bool {
+    if !requires_evidence_for_query(query) {
+        return true;
+    }
+    let evidence_steps = collect_evidence_tool_names(steps);
+    if evidence_steps.is_empty() {
+        return false;
+    }
+    if requires_multi_tool_validation(query) {
+        if evidence_steps.len() < 2 {
+            return false;
+        }
+        if is_project_query(query) && !has_project_evidence(steps) {
+            return false;
+        }
+        if is_identity_or_romance_query(query) {
+            return has_explicit_chat_evidence(steps) || has_non_chat_strong_identity_evidence(steps);
+        }
+        return true;
+    }
+    if is_project_query(query) {
+        return has_project_evidence(steps);
+    }
+    evidence_steps.len() >= 1
+}
+
+fn is_project_query(query: &str) -> bool {
+    let q = query.to_lowercase();
+    q.contains("project")
+        || q.contains("projects")
+        || q.contains("code")
+        || q.contains("repo")
+        || q.contains("worked on")
+        || q.contains("work i did")
+}
+
+fn has_project_evidence(steps: &[AgentStep]) -> bool {
+    for step in steps {
+        let name = step.tool_name.as_str();
+        if name == "get_recent_file_changes" {
+            return step_has_material_evidence(step);
+        }
+        let out = step.tool_result.to_lowercase();
+        if out.contains(".ts")
+            || out.contains(".tsx")
+            || out.contains(".js")
+            || out.contains(".rs")
+            || out.contains(".py")
+            || out.contains("github")
+            || out.contains("repo")
+            || out.contains("pull request")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_identity_or_romance_query(query: &str) -> bool {
+    let q = query.to_lowercase();
+    q.contains("crush")
+        || q.contains("girl")
+        || q.contains("boy")
+        || q.contains("name")
+        || q.contains("whom do i")
+        || q.contains("who do i")
+        || q.contains("love")
+}
+
+fn has_explicit_chat_evidence(steps: &[AgentStep]) -> bool {
+    for step in steps {
+        let out = step.tool_result.to_lowercase();
+        if out.contains("whatsapp")
+            || out.contains("telegram")
+            || out.contains("instagram")
+            || out.contains("chat")
+            || out.contains("message")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_non_chat_strong_identity_evidence(steps: &[AgentStep]) -> bool {
+    let mut support_hits = 0usize;
+    for step in steps {
+        if !step_has_material_evidence(step) {
+            continue;
+        }
+        let out = step.tool_result.to_lowercase();
+        if out.contains("linkedin")
+            || out.contains("profile")
+            || out.contains("call log")
+            || out.contains("contact")
+            || out.contains("frequent")
+        {
+            support_hits += 1;
+        }
+    }
+    support_hits >= 2
+}
+
+fn scrub_unsupported_communication_claims(answer: &str, query: &str, steps: &[AgentStep]) -> String {
+    if !is_identity_or_romance_query(query) || has_explicit_chat_evidence(steps) {
+        return answer.to_string();
+    }
+
+    let lower = answer.to_lowercase();
+    let likely_chat_claim = lower.contains("texted")
+        || lower.contains("chatted")
+        || lower.contains("whatsapp")
+        || lower.contains("messaged");
+    if !likely_chat_claim {
+        return answer.to_string();
+    }
+
+    format!(
+        "{}\n\nNote: I don't have explicit chat-app evidence in this time range, so I cannot claim texting/chats.",
+        answer
+    )
+}
+
+fn collect_evidence_tool_names(steps: &[AgentStep]) -> std::collections::HashSet<String> {
+    let mut distinct = std::collections::HashSet::new();
+    for step in steps {
+        if !step_has_material_evidence(step) {
+            continue;
+        }
+        match step.tool_name.as_str() {
+            "get_recent_ocr" | "search_ocr" | "get_recent_activities" | "query_activities" | "get_recent_file_changes" | "get_music_history" | "get_usage_stats" => {
+                distinct.insert(step.tool_name.clone());
+            }
+            "parallel_search" => {
+                if let Some(calls) = step.tool_args.get("calls").and_then(|v| v.as_array()) {
+                    for call in calls {
+                        if let Some(tool) = call.get("tool").and_then(|v| v.as_str()) {
+                            distinct.insert(tool.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    distinct
+}
+
+fn step_has_material_evidence(step: &AgentStep) -> bool {
+    let out = step.tool_result.trim();
+    if out.is_empty() || out == "[]" || out == "{}" {
+        return false;
+    }
+    let lower = out.to_lowercase();
+    !(lower.contains("no results")
+        || lower.contains("0 result")
+        || lower.contains("no matching")
+        || lower.contains("\"results\":[]")
+        || lower.contains("\"items\":[]"))
+}
+
+fn contains_internal_tool_markup(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    text.contains("<|tool_")
+        || lower.contains("tool_calls_section_begin")
+        || lower.contains("tool_call_begin")
+        || lower.contains("tool_call_argument_begin")
+        || lower.contains("tool_calls_section_end")
+}
+
+fn strip_internal_stream_markup(text: &str) -> String {
+    text
+        .replace("<|tool_calls_section_begin|>", "")
+        .replace("<|tool_calls_section_end|>", "")
+        .replace("<|tool_call_begin|>", "")
+        .replace("<|tool_call_end|>", "")
+        .replace("<|tool_call_argument_begin|>", "")
 }
 
 fn parse_iso_to_unix(iso: &str) -> Option<i64> {
@@ -1768,7 +2648,7 @@ async fn synthesize_answer_from_evidence(
     }
 
     let summary_prompt = format!(
-        "User query: {query}\nTime scope: {label} ({start} to {end})\nEvidence items: {count}\nTool evidence:\n{evidence}\n\nReturn a detailed, crisp, and highly specific final answer. Break down the activities chronologically or by major tasks. Mention specific window titles, exact times, and specific apps/websites visited. Do not just give a high-level summary of time spent. Provide a rich narrative of what the user was actually doing. Do not call tools. If evidence is weak, clearly state uncertainty.",
+        "User query: {query}\nTime scope: {label} ({start} to {end})\nEvidence items: {count}\nTool evidence:\n{evidence}\n\nReturn a detailed, crisp, and highly specific final answer. Start with a direct answer, then provide evidence bullets with exact times, app names, and window titles. Break down activities chronologically or by major tasks. Do not just give a high-level summary of time spent. Include a short confidence statement and explicitly list missing evidence when uncertain. Do not call tools.",
         query = user_query,
         label = scope.label,
         start = format_time_scope_ts(scope.start_ts),
@@ -1784,7 +2664,7 @@ async fn synthesize_answer_from_evidence(
     let messages = vec![
         ChatMessage {
             role: "system".to_string(),
-            content: "You are a precise assistant. Produce one final answer from provided evidence only. Provide specific details, window titles, and times. No tool JSON.".to_string(),
+            content: "You are a precise assistant. Produce one final answer from provided evidence only. Be detailed, specific, and not overly brief. Include direct answer, evidence bullets, and confidence. No tool JSON.".to_string(),
         },
         ChatMessage {
             role: "user".to_string(),
@@ -1795,7 +2675,11 @@ async fn synthesize_answer_from_evidence(
     if matches!(try_parse_tool_call_response(&out), Some(AgentResponse::ToolCall { .. })) {
         return Ok("I gathered evidence but could not produce a stable final summary. Please ask with a specific app/date and I’ll answer exactly.".to_string());
     }
-    Ok(normalize_final_answer(&out))
+    let cleaned = strip_internal_stream_markup(&out)
+        .replace("<think>", "")
+        .replace("</think>", "");
+    let normalized = normalize_final_answer_hardened(&cleaned);
+    Ok(scrub_unsupported_communication_claims(&normalized, user_query, steps))
 }
 
 // Streaming LLM Call
@@ -1816,7 +2700,7 @@ where F: FnMut(&str) {
         model: model.to_string(),
         messages: messages.to_vec(),
         temperature: 0.0,
-        max_tokens: 1024,
+        max_tokens: 1600,
         stream: true,
     };
 
@@ -1903,5 +2787,3 @@ async fn call_llm(model: &str, api_key: &str, messages: &[ChatMessage]) -> Resul
     call_llm_stream(model, api_key, messages, &mut out, |_| {}).await?;
     Ok(out)
 }
-
-
